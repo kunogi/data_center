@@ -1,85 +1,37 @@
-import os
 import baostock as bs
 import pandas as pd
-import time
 import sqlite3
+import requests
+import time
+import os
+import sys
 from datetime import datetime, timedelta
-from config import DB_PATH, BLACKLIST_FILE, DEFAULT_START_DATE, CORE_INDICES
+from multiprocessing import Pool, cpu_count
+
+try:
+    from config import DB_PATH, CORE_INDICES, BLACKLIST_FILE
+except ImportError:
+    DB_PATH = "quant_data.db"
+    BLACKLIST_FILE = "blacklist.txt"
+    CORE_INDICES = ['sh.000001', 'sz.399001', 'sz.399107', 'sh.000300', 'sz.399006', 'sh.000905', 'sh.000852', 'bj.899050']
 
 def get_db_conn():
     return sqlite3.connect(DB_PATH)
 
-def init_database():
-    """初始化核心数据库表结构 (仅保留 K 线数据)"""
-    conn = get_db_conn()
-    cursor = conn.cursor()
-    
-    # K 线表：核心计算引擎的基石
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS daily_k_data (
-            date TEXT,
-            code TEXT,
-            open REAL,
-            high REAL,
-            low REAL,
-            close REAL,
-            volume REAL,
-            amount REAL,
-            pctChg REAL,
-            turn REAL,
-            PRIMARY KEY (date, code)
-        )
-    """)
-    
-    conn.commit()
-    conn.close()
-
 def load_blacklist():
-    if not os.path.exists(BLACKLIST_FILE):
-        return set()
-    blacklist = set()
+    if not os.path.exists(BLACKLIST_FILE): return set()
     with open(BLACKLIST_FILE, 'r', encoding='utf-8') as f:
-        for line in f:
-            code = line.split('#')[0].strip()
-            if code:
-                blacklist.add(code)
-    return blacklist
-
-def get_real_target_date():
-    """通过 Baostock 获取最近一个合法的交易日"""
-    lg = bs.login()
-    if lg.error_code != '0':
-        print(f"登录失败：{lg.error_msg}")
-        return datetime.now().strftime("%Y-%m-%d")
-        
-    start_lookback = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
-    end_lookback = datetime.now().strftime("%Y-%m-%d")
-    
-    rs = bs.query_trade_dates(start_date=start_lookback, end_date=end_lookback)
-    dates_df = rs.get_data()
-    bs.logout()
-    
-    valid_dates = dates_df[dates_df['is_trading_day'] == '1']['calendar_date'].values
-    if len(valid_dates) > 0:
-        last_trade_date = valid_dates[-1]
-        # 如果今天是交易日但还未收盘（16点前），则同步到前一个交易日
-        if last_trade_date == datetime.now().strftime("%Y-%m-%d") and datetime.now().hour < 16:
-            return valid_dates[-2] if len(valid_dates) > 1 else last_trade_date
-        return last_trade_date
-    return datetime.now().strftime("%Y-%m-%d")
+        return set(line.strip() for line in f if line.strip())
 
 def get_todo_list(target_date, blacklist):
     """【真·全市场动态对齐】通过花名册 Diff 机制，自动捕捉新股并彻底过滤垃圾指数"""
     conn = get_db_conn()
-    
-    # 1. 获取本地数据库的更新进度字典 {code: max_date}
     sql = "SELECT code, MAX(date) as max_date FROM daily_k_data GROUP BY code"
     df_db = pd.read_sql_query(sql, conn)
     db_progress = dict(zip(df_db['code'], df_db['max_date']))
     conn.close()
 
     print(f"📡 正在向交易所请求 {target_date} 的全市场动态花名册...")
-    
     bs.login() 
     rs = bs.query_all_stock(day=target_date)
     all_active_codes = []
@@ -99,7 +51,6 @@ def get_todo_list(target_date, blacklist):
         print("⚠️ 花名册请求失败，降级为本地存量更新模式...")
         all_active_codes = [c for c in db_progress.keys() if c.startswith(valid_prefixes)] + CORE_INDICES
 
-    # 3. Diff 对比：生成最终待办清单
     todo_list = []
     for code in all_active_codes:
         # 💥 救命补丁：如果是 bj 或 399，必须检查它是不是 VIP 指数。只有不是 VIP 的才杀！
@@ -110,8 +61,6 @@ def get_todo_list(target_date, blacklist):
             continue
             
         last_date = db_progress.get(code)
-        
-        # 逻辑：如果本地没记录 (刚才被你删了)，或者记录过期了，就加入下载队列
         if last_date is None or last_date < target_date:
             todo_list.append(code)
             
@@ -124,192 +73,133 @@ def get_todo_list(target_date, blacklist):
 
     return list(set(todo_list))
 
-def interactive_filter(todo_list):
-    if not todo_list: return []
-    if len(todo_list) > 20:
-        print(f"🚀 待更新标的较多 ({len(todo_list)} 只)，直接进入全量同步队列...")
-        return todo_list
+def fetch_eastmoney_kline(code, start_date, end_date):
+    """💥 专门为 Baostock 不支持的指数（如北证50）开的东方财富小灶"""
+    if code == 'bj.899050':
+        secid = "0.899050"
+    else:
+        return []
         
-    print(f"\n👀 发现少量数据落后标的 ({len(todo_list)} 只)，启动人工确认模式：")
-    final_list = []
-    auto_action = None 
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {
+        "secid": secid,
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "klt": "101",
+        "fqt": "1",
+        "end": "20500101",
+        "lmt": "200"  # 拉取最近 200 天，足够覆盖各种断点
+    }
+    headers = {"User-Agent": "Mozilla/5.0"}
     
-    for code in todo_list:
-        if auto_action == 'allY':
-            final_list.append(code)
-            continue
-        elif auto_action == 'allN':
-            continue
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        data = resp.json()
+        if not data.get("data") or not data["data"].get("klines"):
+            return []
             
-        while True:
-            # 🌟 优化：提示信息中加入默认操作说明
-            raw_ans = input(f"   发现 {code} 数据落后，是否联网同步？[y/n/allY/allN] [默认 allN]: ").strip()
-            
-            # 🌟 核心逻辑：处理直接回车的情况
-            if not raw_ans:
-                ans = 'alln'
-            else:
-                ans = raw_ans.lower()
+        klines = data["data"]["klines"]
+        result = []
+        for k in klines:
+            parts = k.split(',')
+            date = parts[0]
+            if not (start_date <= date <= end_date):
+                continue
                 
-            if ans == 'y':
-                final_list.append(code)
-                break
-            elif ans == 'n':
-                break
-            elif ans == 'ally':
-                auto_action = 'allY'
-                final_list.append(code)
-                print("   👉 已选择 allY，后续标的自动加入队列。")
-                break
-            elif ans == 'alln':
-                auto_action = 'allN'
-                print("   👉 已选择 allN，后续标的全部跳过。")
-                break
-            else:
-                print("   ⚠️ 输入无效，请准确输入 [y/n/allY/allN]，或直接回车使用默认值 allN。")
-    return final_list
+            open_val, close_val, high_val, low_val = parts[1], parts[2], parts[3], parts[4]
+            vol, amount, pct_chg = parts[5], parts[6], parts[8]
+            turn = parts[10] if parts[10] != '-' else '0'
+            
+            # 严格对齐 daily_k_data 表结构: (date, code, open, high, low, close, volume, amount, turn, pctChg)
+            result.append((date, code, open_val, high_val, low_val, close_val, vol, amount, turn, pct_chg))
+        return result
+    except Exception as e:
+        print(f"⚠️ 东方财富 API 请求 {code} 失败: {e}")
+        return []
 
-def sync_single_stock(code, target_date, conn):
-    cursor = conn.cursor()
-    cursor.execute("SELECT date, close FROM daily_k_data WHERE code=? ORDER BY date DESC LIMIT 1", (code,))
-    row = cursor.fetchone()
-    
-    need_full_reload = False
-    last_date = None
-    db_close = None
-    
-    if row:
-        last_date, db_close = row[0], float(row[1])
-        fetch_start = last_date
-    else:
-        need_full_reload = True
-        fetch_start = DEFAULT_START_DATE
+def worker_init():
+    bs.login()
 
-    rs = bs.query_history_k_data_plus(
-        code, "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST",
-        start_date=fetch_start, end_date=target_date,
-        frequency="d", adjustflag="3"
-    )
-    
-    data_list = []
-    while (rs.error_code == '0') and rs.next():
-        data_list.append(rs.get_row_data())
-
-    if not data_list:
-        return False, "无新数据 (可能停牌)"
-
-    df = pd.DataFrame(data_list, columns=rs.fields)
-    df = df[['date', 'code', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pctChg', 'turn']]
-    for col in ['open', 'high', 'low', 'close', 'volume', 'amount', 'pctChg', 'turn']:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-
-    if not need_full_reload and last_date is not None:
-        overlap_row = df[df['date'] == last_date]
-        if not overlap_row.empty:
-            fetched_close = float(overlap_row.iloc[0]['close'])
-            # 校验收盘价，防止除权导致的均线漂移
-            if abs(fetched_close - db_close) > 0.01:
-                need_full_reload = True
-                print(f"\n   🔄 触发自愈：{code} 发生除权，执行全量重载...")
-            else:
-                df = df[df['date'] > last_date]
+def sync_single_stock(args):
+    code, start_date, end_date = args
+    try:
+        # 💥 拦截分流：如果是北交所，走特权通道
+        if code == 'bj.899050':
+            data_list = fetch_eastmoney_kline(code, start_date, end_date)
         else:
-            df = df[df['date'] > last_date]
+            # 正常 A股走 Baostock
+            rs = bs.query_history_k_data_plus(
+                code,
+                "date,code,open,high,low,close,volume,amount,turn,pctChg",
+                start_date=start_date, end_date=end_date,
+                frequency="d", adjustflag="2"
+            )
+            data_list = []
+            while (rs.error_code == '0') and rs.next():
+                data_list.append(rs.get_row_data())
+        
+        return {'code': code, 'status': 'success', 'data': data_list}
+    except Exception as e:
+        return {'code': code, 'status': 'error', 'msg': str(e)}
 
-    if need_full_reload and last_date is not None:
-        rs = bs.query_history_k_data_plus(
-            code, "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST",
-            start_date=DEFAULT_START_DATE, end_date=target_date,
-            frequency="d", adjustflag="3"
+def run_kline_sync():
+    conn = get_db_conn()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS daily_k_data (
+            date TEXT, code TEXT, open REAL, high REAL, low REAL, close REAL,
+            volume REAL, amount REAL, turn REAL, pctChg REAL,
+            PRIMARY KEY (code, date)
         )
-        data_list = []
-        while (rs.error_code == '0') and rs.next():
-            data_list.append(rs.get_row_data())
-            
-        if not data_list:
-            return False, "全量自愈拉取时无数据"
-            
-        df = pd.DataFrame(data_list, columns=rs.fields)
-        df = df[['date', 'code', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pctChg', 'turn']]
-        for col in ['open', 'high', 'low', 'close', 'volume', 'amount', 'pctChg', 'turn']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-        cursor.execute("DELETE FROM daily_k_data WHERE code=?", (code,))
-
-    if not df.empty:
-        df.to_sql('daily_k_data', conn, if_exists='append', index=False)
-        conn.commit()
-        msg = "自愈重载完成" if need_full_reload else "增量更新成功"
-        return True, msg
-    else:
-        return False, "无增量数据"
-
-# ==========================================
-# 🚀 主流程 (纯净 K 线同步模式)
-# ==========================================
-
-def run_main_sync():
-    init_database()
+    """)
+    conn.commit()
     
-    target_date = get_real_target_date()
+    target_date = datetime.now().strftime('%Y-%m-%d')
     blacklist = load_blacklist()
-    
-    print(f"\n>>> 开始量化数据同步 (目标交易日：{target_date})")
-    if blacklist:
-        print(f"🛡️ 已加载黑名单，主动屏蔽 {len(blacklist)} 只标的。")
-    
     todo_list = get_todo_list(target_date, blacklist)
     
-    if len(todo_list) == 0:
-        print("✅ 所有活跃标的数据已对齐，无需更新 K 线。")
+    if not todo_list:
+        print("✅ 所有 K 线数据均已是最新，无需同步。")
+        conn.close()
         return
 
-    final_sync_list = interactive_filter(todo_list)
+    print(f"🚀 开始同步 {len(todo_list)} 只标的 K 线数据...")
     
-    if len(final_sync_list) == 0:
-        print("✅ 用户取消同步，操作结束。")
-        return
-
-    print(f"\n🚀 开始顺序同步 {len(final_sync_list)} 只标的...")
+    sql = "SELECT code, MAX(date) as max_date FROM daily_k_data GROUP BY code"
+    df_db = pd.read_sql_query(sql, conn)
+    db_progress = dict(zip(df_db['code'], df_db['max_date']))
     
-    lg = bs.login()
-    if lg.error_code != '0':
-        print(f"❌ Baostock 登录失败：{lg.error_msg}")
-        return
-
-    conn = get_db_conn()
-    success_count = 0
-    total_tasks = len(final_sync_list)
-    
-    # 💥 1. 记录总开始时间
+    tasks = []
+    for code in todo_list:
+        last_date = db_progress.get(code)
+        if last_date:
+            start_date = (datetime.strptime(last_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+        else:
+            start_date = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')
+        tasks.append((code, start_date, target_date))
+        
+    insert_sql = "INSERT OR REPLACE INTO daily_k_data VALUES (?,?,?,?,?,?,?,?,?,?)"
+    process_count = min(8, cpu_count() * 2)
     start_time = time.time()
     
-    for i, code in enumerate(final_sync_list):
-        current_idx = i + 1
-        try:
-            status, msg = sync_single_stock(code, target_date, conn)
-            
-            # 💥 2. 动态计算 ETA
-            elapsed_time = time.time() - start_time
-            # 计算平均每个股票耗时，乘以剩余股票数，得出预计剩余时间
-            eta_seconds = int((elapsed_time / current_idx) * (total_tasks - current_idx))
-            eta_str = str(timedelta(seconds=eta_seconds))
-            
-            if status is True:
-                success_count += 1
-                print(f"   [{current_idx}/{total_tasks}] ✅ {code}: {msg} | ETA: {eta_str}")
+    with Pool(processes=process_count, initializer=worker_init) as pool:
+        for idx, result in enumerate(pool.imap_unordered(sync_single_stock, tasks), 1):
+            if result['status'] == 'success' and result['data']:
+                cursor.executemany(insert_sql, result['data'])
+                conn.commit()
+                res_msg = f"✅ 更新了 {len(result['data'])} 条"
+            elif result['status'] == 'success':
+                res_msg = "⚠️ 无新数据"
             else:
-                print(f"   [{current_idx}/{total_tasks}] ⏸️ {code}: {msg} | ETA: {eta_str}")
-                
-        except Exception as e:
-            print(f"   [{current_idx}/{total_tasks}] ⚠️ {code} 异常：{e}")
+                res_msg = f"❌ 失败: {result['msg'][:20]}"
+            
+            elapsed = time.time() - start_time
+            eta = str(timedelta(seconds=int((elapsed/idx)*(len(tasks)-idx))))
+            print(f"[{idx}/{len(tasks)}] {result['code']} {res_msg} | ETA: {eta}")
             
     conn.close()
     bs.logout()
-    
-    # 💥 3. 结束时顺便打印总耗时
-    total_elapsed = str(timedelta(seconds=int(time.time() - start_time)))
-    print(f"\n✨ 数据对齐完成！成功更新：{success_count} 只标的。总耗时: {total_elapsed}")
+    print("🎉 K线数据同步完成！")
 
 if __name__ == "__main__":
-    run_main_sync()
+    run_kline_sync()

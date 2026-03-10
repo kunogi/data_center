@@ -10,7 +10,7 @@ def main():
     try:
         # 第一步：先对齐全市场 K 线
         print("\n[1/2] 正在执行全市场 K 线数据对齐...")
-        data_sync.run_main_sync()
+        data_sync.run_kline_sync()
         
         # 第二步：再拉取活跃股票的财务因子
         print("\n[2/2] 正在执行活跃股票财务因子对齐...")
