@@ -122,7 +122,16 @@ def sync_financial_factors(limit=None):
     conn = sqlite3.connect(DB_PATH)
     recent_date = (datetime.now() - timedelta(days=ACTIVE_DAYS)).strftime('%Y-%m-%d')
     active_df = pd.read_sql_query(f"SELECT DISTINCT code FROM daily_k_data WHERE date >= '{recent_date}' AND volume > 0", conn)
-    stock_codes = [c for c in active_df['code'].tolist() if c not in blacklist and c not in completed]
+    
+    # 精确到第二位前缀，彻底封杀 `sz.399` 开头的深市指数！
+    valid_prefixes = ('sh.6', 'sz.00', 'sz.30', 'bj.8', 'bj.4', 'bj.9')
+    
+    stock_codes = [
+        c for c in active_df['code'].tolist() 
+        if c not in blacklist 
+        and c not in completed
+        and c.startswith(valid_prefixes)  
+    ]
     
     if limit: stock_codes = stock_codes[:limit]
     total_tasks = len(stock_codes)
@@ -131,7 +140,7 @@ def sync_financial_factors(limit=None):
         conn.close()
         return
 
-    print(f"🚀 启动 {PROCESS_COUNT} 个进程，拉取 {total_tasks} 只股票财务数据...")
+    print(f"🚀 启动 {PROCESS_COUNT} 个进程，拉取 {total_tasks} 只正规 A 股财务数据 (已彻底过滤指数)...")
     cursor = conn.cursor()
     start_time = time.time()
     
