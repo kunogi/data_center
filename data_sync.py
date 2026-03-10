@@ -69,7 +69,7 @@ def get_real_target_date():
     return datetime.now().strftime("%Y-%m-%d")
 
 def get_todo_list(target_date, blacklist):
-    """【真·全市场动态对齐】通过花名册 Diff 机制，自动捕捉新股并过滤垃圾指数"""
+    """【真·全市场动态对齐】通过花名册 Diff 机制，自动捕捉新股并彻底过滤垃圾指数"""
     conn = get_db_conn()
     
     # 1. 获取本地数据库的更新进度字典 {code: max_date}
@@ -80,37 +80,38 @@ def get_todo_list(target_date, blacklist):
 
     print(f"📡 正在向交易所请求 {target_date} 的全市场动态花名册...")
     
-    # 👇 💥 补丁 1：在这里重新唤醒 Baostock 连接！
     bs.login() 
-    
-    # 2. 获取目标日的真实全市场名单
     rs = bs.query_all_stock(day=target_date)
     all_active_codes = []
+    
+    # 💥 核心白名单：只放行沪深纯正A股
+    valid_prefixes = ('sh.6', 'sz.00', 'sz.30')
     
     while (rs.error_code == '0') and rs.next():
         row = rs.get_row_data()
         code = row[0]
-        # 核心过滤：只留 A股 + VIP指数
-        if code.startswith(('sh.6', 'sz.0', 'sz.3', 'bj.8', 'bj.4', 'bj.9')) or code in CORE_INDICES:
+        if code.startswith(valid_prefixes) or code in CORE_INDICES:
             all_active_codes.append(code)
             
-    # 👇 💥 补丁 2：拿完花名册，文明登出释放资源
     bs.logout()
     
-    # 如果接口抽风没返回数据，就用保底机制
     if not all_active_codes:
         print("⚠️ 花名册请求失败，降级为本地存量更新模式...")
-        all_active_codes = list(db_progress.keys()) + CORE_INDICES
+        all_active_codes = [c for c in db_progress.keys() if c.startswith(valid_prefixes)] + CORE_INDICES
 
     # 3. Diff 对比：生成最终待办清单
     todo_list = []
     for code in all_active_codes:
+        # 💥 救命补丁：如果是 bj 或 399，必须检查它是不是 VIP 指数。只有不是 VIP 的才杀！
+        if (code.startswith('bj.') or code.startswith('sz.399')) and (code not in CORE_INDICES):
+            continue
+            
         if code in blacklist:
             continue
             
         last_date = db_progress.get(code)
         
-        # 逻辑：如果本地没记录 (新股/新指数)，或者记录过期了，就加入下载队列
+        # 逻辑：如果本地没记录 (刚才被你删了)，或者记录过期了，就加入下载队列
         if last_date is None or last_date < target_date:
             todo_list.append(code)
             
@@ -121,7 +122,6 @@ def get_todo_list(target_date, blacklist):
             if last_date is None or last_date < target_date:
                 todo_list.append(idx)
 
-    # 去重返回
     return list(set(todo_list))
 
 def interactive_filter(todo_list):

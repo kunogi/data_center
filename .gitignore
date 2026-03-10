@@ -16,3 +16,4 @@ logs/
 quant_data.db-shm
 quant_data.db-wal
 .vscode/
+test.py
