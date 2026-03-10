@@ -1,9 +1,10 @@
 import os
 import baostock as bs
 import pandas as pd
+import time
 import sqlite3
 from datetime import datetime, timedelta
-from config import DB_PATH, BLACKLIST_FILE, DEFAULT_START_DATE
+from config import DB_PATH, BLACKLIST_FILE, DEFAULT_START_DATE, CORE_INDICES
 
 def get_db_conn():
     return sqlite3.connect(DB_PATH)
@@ -68,17 +69,60 @@ def get_real_target_date():
     return datetime.now().strftime("%Y-%m-%d")
 
 def get_todo_list(target_date, blacklist):
+    """【真·全市场动态对齐】通过花名册 Diff 机制，自动捕捉新股并过滤垃圾指数"""
     conn = get_db_conn()
-    sql = f"""
-        SELECT code, MAX(date) as max_date 
-        FROM daily_k_data 
-        GROUP BY code 
-        HAVING max_date < '{target_date}'
-    """
-    df = pd.read_sql_query(sql, conn)
+    
+    # 1. 获取本地数据库的更新进度字典 {code: max_date}
+    sql = "SELECT code, MAX(date) as max_date FROM daily_k_data GROUP BY code"
+    df_db = pd.read_sql_query(sql, conn)
+    db_progress = dict(zip(df_db['code'], df_db['max_date']))
     conn.close()
-    todo_list = [code for code in df['code'].tolist() if code not in blacklist]
-    return todo_list
+
+    print(f"📡 正在向交易所请求 {target_date} 的全市场动态花名册...")
+    
+    # 👇 💥 补丁 1：在这里重新唤醒 Baostock 连接！
+    bs.login() 
+    
+    # 2. 获取目标日的真实全市场名单
+    rs = bs.query_all_stock(day=target_date)
+    all_active_codes = []
+    
+    while (rs.error_code == '0') and rs.next():
+        row = rs.get_row_data()
+        code = row[0]
+        # 核心过滤：只留 A股 + VIP指数
+        if code.startswith(('sh.6', 'sz.0', 'sz.3', 'bj.8', 'bj.4', 'bj.9')) or code in CORE_INDICES:
+            all_active_codes.append(code)
+            
+    # 👇 💥 补丁 2：拿完花名册，文明登出释放资源
+    bs.logout()
+    
+    # 如果接口抽风没返回数据，就用保底机制
+    if not all_active_codes:
+        print("⚠️ 花名册请求失败，降级为本地存量更新模式...")
+        all_active_codes = list(db_progress.keys()) + CORE_INDICES
+
+    # 3. Diff 对比：生成最终待办清单
+    todo_list = []
+    for code in all_active_codes:
+        if code in blacklist:
+            continue
+            
+        last_date = db_progress.get(code)
+        
+        # 逻辑：如果本地没记录 (新股/新指数)，或者记录过期了，就加入下载队列
+        if last_date is None or last_date < target_date:
+            todo_list.append(code)
+            
+    # 保底：无论如何，VIP 指数必须检查
+    for idx in CORE_INDICES:
+        if idx not in todo_list and idx not in blacklist:
+            last_date = db_progress.get(idx)
+            if last_date is None or last_date < target_date:
+                todo_list.append(idx)
+
+    # 去重返回
+    return list(set(todo_list))
 
 def interactive_filter(todo_list):
     if not todo_list: return []
@@ -235,21 +279,37 @@ def run_main_sync():
 
     conn = get_db_conn()
     success_count = 0
+    total_tasks = len(final_sync_list)
+    
+    # 💥 1. 记录总开始时间
+    start_time = time.time()
     
     for i, code in enumerate(final_sync_list):
+        current_idx = i + 1
         try:
             status, msg = sync_single_stock(code, target_date, conn)
+            
+            # 💥 2. 动态计算 ETA
+            elapsed_time = time.time() - start_time
+            # 计算平均每个股票耗时，乘以剩余股票数，得出预计剩余时间
+            eta_seconds = int((elapsed_time / current_idx) * (total_tasks - current_idx))
+            eta_str = str(timedelta(seconds=eta_seconds))
+            
             if status is True:
                 success_count += 1
-                print(f"   [{i+1}/{len(final_sync_list)}] ✅ {code}: {msg}")
+                print(f"   [{current_idx}/{total_tasks}] ✅ {code}: {msg} | ETA: {eta_str}")
             else:
-                print(f"   [{i+1}/{len(final_sync_list)}] ⏸️ {code}: {msg}")
+                print(f"   [{current_idx}/{total_tasks}] ⏸️ {code}: {msg} | ETA: {eta_str}")
+                
         except Exception as e:
-            print(f"   [{i+1}/{len(final_sync_list)}] ⚠️ {code} 异常：{e}")
+            print(f"   [{current_idx}/{total_tasks}] ⚠️ {code} 异常：{e}")
             
     conn.close()
     bs.logout()
-    print(f"\n✨ 数据对齐完成！成功更新：{success_count} 只标的。")
+    
+    # 💥 3. 结束时顺便打印总耗时
+    total_elapsed = str(timedelta(seconds=int(time.time() - start_time)))
+    print(f"\n✨ 数据对齐完成！成功更新：{success_count} 只标的。总耗时: {total_elapsed}")
 
 if __name__ == "__main__":
     run_main_sync()
