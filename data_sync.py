@@ -9,10 +9,12 @@ from datetime import datetime, timedelta
 from multiprocessing import Pool, cpu_count
 
 try:
-    from config import DB_PATH, CORE_INDICES, BLACKLIST_FILE
+    # 💥 引入被冷落已久的 DAILY_K_DAYS 参数
+    from config import DB_PATH, CORE_INDICES, BLACKLIST_FILE, DAILY_K_DAYS
 except ImportError:
     DB_PATH = "quant_data.db"
     BLACKLIST_FILE = "blacklist.txt"
+    DAILY_K_DAYS = 365
     CORE_INDICES = ['sh.000001', 'sz.399001', 'sz.399107', 'sh.000300', 'sz.399006', 'sh.000905', 'sh.000852', 'bj.899050']
 
 def get_db_conn():
@@ -175,7 +177,8 @@ def run_kline_sync():
         if last_date:
             start_date = (datetime.strptime(last_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
         else:
-            start_date = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')
+            # 💥 修复：不再硬编码 180 天，而是使用 config.py 中的 DAILY_K_DAYS 掌握最高控制权
+            start_date = (datetime.now() - timedelta(days=DAILY_K_DAYS)).strftime('%Y-%m-%d')
         tasks.append((code, start_date, target_date))
         
     insert_sql = "INSERT OR REPLACE INTO daily_k_data VALUES (?,?,?,?,?,?,?,?,?,?)"
