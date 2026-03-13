@@ -14,7 +14,7 @@ def main():
         
         # 第二步：再拉取活跃股票的财务因子
         print("\n[2/2] 正在执行活跃股票财务因子对齐...")
-        factor_sync.sync_financials()
+        factor_sync.run_factor_sync()
         
         print("\n✅✅✅ 数据中台全量同步完成！所有模型现可安全读取。")
     except KeyboardInterrupt:
