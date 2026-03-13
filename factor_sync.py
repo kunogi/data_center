@@ -4,17 +4,17 @@ import pandas as pd
 from datetime import datetime
 import os
 import time
+import re  # 💥 引入正则库，用于清洗 Baostock 的脏数据
 
 # 💥 快速失败机制：直接强制导入，如果缺少配置直接报错阻断，拒绝产生幽灵数据
 from config import DB_PATH, FINANCIAL_QUARTERS, COMPLETED_FILE, EXPIRE_DAYS
 
 def init_db():
-    """💥 静态化数据结构：一次性建表，抛弃运行时的 ALTER TABLE 动态检查"""
+    """💥 静态化数据结构：一次性建表，包含财务事实表与基础维度表"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # 使用完整的最终版数据字典建表
-    # 注: PRIMARY KEY 会自动创建名为 sqlite_autoindex_financial_factors_1 的唯一索引
+    # 1. 创建财务因子事实表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS financial_factors (
             code TEXT,
@@ -41,8 +41,62 @@ def init_db():
             PRIMARY KEY (code, stat_date, pub_date)
         )
     ''')
+    
+    # 2. 创建股票基础信息维度表 (星型模型架构核心)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS stock_basic (
+            code TEXT PRIMARY KEY,
+            name TEXT,
+            industry TEXT,
+            industry_classification TEXT
+        )
+    ''')
+    
     conn.commit()
     conn.close()
+
+def sync_stock_basic():
+    """💥 毫秒级雷达：同步全市场股票的基础静态信息 (自带脏数据清洗过滤)"""
+    print("📡 正在同步全市场股票基础信息(行业分类)...")
+    rs = bs.query_stock_industry()
+    
+    if rs.error_code != '0':
+        print(f"⚠️ 行业信息获取失败: {rs.error_msg}")
+        return
+
+    basic_data = []
+    while rs.next():
+        row = rs.get_row_data()
+        # Baostock 原生 row: [updateDate, code, code_name, industry(含代码的脏数据), industryClassification(废话)]
+        code = row[1]
+        if code.startswith(('sh.6', 'sz.0', 'sz.3')):
+            name = row[2]
+            raw_industry = row[3]  # 例如: "J66货币金融服务"
+            
+            # 💥 数据清洗：用正则分离行业代码 (字母+数字) 和纯中文行业名
+            match = re.match(r'^([A-Za-z0-9]+)(.*)$', raw_industry)
+            if match:
+                ind_code = match.group(1)   # 提取出 "J66"
+                ind_name = match.group(2)   # 提取出 "货币金融服务"
+            else:
+                ind_code = "未知"
+                ind_name = raw_industry if raw_industry else "未知"
+                
+            # 我们直接废弃 Baostock 返回的废话 "证监会行业分类"
+            # 将纯净的中文名存入 industry，将提取的代码存入 industry_classification
+            basic_data.append((code, name, ind_name, ind_code))
+
+    if basic_data:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        # 使用 REPLACE，如果有股票改名或者行业变更，自动热更新
+        cursor.executemany('''
+            INSERT OR REPLACE INTO stock_basic (code, name, industry, industry_classification)
+            VALUES (?, ?, ?, ?)
+        ''', basic_data)
+        conn.commit()
+        conn.close()
+        print(f"✅ 成功更新 {len(basic_data)} 只股票的基础行业画像！数据已极致净化。")
 
 def load_progress():
     """读取带有时间戳的断点续传记录"""
@@ -148,6 +202,9 @@ def run_factor_sync(auto_confirm=False):
         return
 
     init_db()
+    
+    # 💥 首先同步轻量级的静态基础维度数据
+    sync_stock_basic()
 
     print("📡 正在获取 A股 股票列表...")
     rs = bs.query_stock_basic()
@@ -206,7 +263,6 @@ def run_factor_sync(auto_confirm=False):
             records = fetch_historical_financial_data(code, num_quarters=FINANCIAL_QUARTERS)
             if records:
                 for rec in records:
-                    # 按照确定好的静态 Schema 写入数据
                     cursor.execute('''
                         INSERT OR REPLACE INTO financial_factors (
                             code, stat_date, pub_date, update_date, roe_avg, yoy_profit_growth, net_profit, 
