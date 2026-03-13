@@ -1,197 +1,239 @@
 import baostock as bs
-import pandas as pd
 import sqlite3
-from datetime import datetime, timedelta
-import time
+import pandas as pd
+from datetime import datetime
 import os
-import argparse
-import sys
-from multiprocessing import Pool, cpu_count
-from config import DB_PATH, BLACKLIST_FILE, COMPLETED_FILE
+import time
 
-# 💥 为了强制全量更新补充新字段，设为 -1。跑完今天这遍后，请务必改回 30！
-EXPIRE_DAYS = 30                
-ACTIVE_DAYS = 30                # 只更新最近 X 天活跃股
-PROCESS_COUNT = min(8, cpu_count() * 2)
+# 💥 快速失败机制：直接强制导入，如果缺少配置直接报错阻断，拒绝产生幽灵数据
+from config import DB_PATH, FINANCIAL_QUARTERS, COMPLETED_FILE, EXPIRE_DAYS
 
-def get_latest_financial_quarter():
-    """根据当前物理时间，推算全市场最完整的最新财报季度"""
+def init_db():
+    """💥 静态化数据结构：一次性建表，抛弃运行时的 ALTER TABLE 动态检查"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # 使用完整的最终版数据字典建表
+    # 注: PRIMARY KEY 会自动创建名为 sqlite_autoindex_financial_factors_1 的唯一索引
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS financial_factors (
+            code TEXT,
+            stat_date TEXT,
+            pub_date TEXT,
+            roe_avg REAL,
+            yoy_profit_growth REAL,
+            np_margin REAL,
+            gp_margin REAL,
+            eps_ttm REAL,
+            net_profit REAL,
+            mb_revenue REAL,
+            update_date TEXT, 
+            liability_ratio REAL, 
+            cash_flow REAL, 
+            gross_margin REAL, 
+            net_margin REAL, 
+            cfo_to_np REAL, 
+            cfo_to_gr REAL, 
+            inv_turn_days REAL, 
+            nr_turn_days REAL, 
+            yoy_pni REAL, 
+            total_share REAL,
+            PRIMARY KEY (code, stat_date, pub_date)
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def load_progress():
+    """读取带有时间戳的断点续传记录"""
+    progress = {}
+    if os.path.exists(COMPLETED_FILE):
+        with open(COMPLETED_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                parts = line.split(',')
+                if len(parts) >= 2:
+                    progress[parts[0]] = parts[1]
+                else:
+                    progress[parts[0]] = "2000-01-01 00:00:00"
+    return progress
+
+def save_progress(progress_dict):
+    """保存进度与时间戳"""
+    with open(COMPLETED_FILE, "w", encoding="utf-8") as f:
+        for code, ts in progress_dict.items():
+            f.write(f"{code},{ts}\n")
+
+def fetch_historical_financial_data(code, num_quarters=FINANCIAL_QUARTERS):
+    """提取过去 N 个季度的完整财务与护城河指标"""
     now = datetime.now()
     year = now.year
     month = now.month
     
-    if month <= 4:
-        # 1-4月：去年年报和今年一季报在4月底才披露完，最完整的是【去年Q3】
-        return str(year - 1), "3"
+    if month <= 4: 
+        year -= 1
+        quarter = 4
     elif month <= 8:
-        # 5-8月：一季报已出完，半年报要到8月底，最完整的是【今年Q1】
-        return str(year), "1"
+        quarter = 1
     elif month <= 10:
-        # 9-10月：半年报已出完，三季报要到10月底，最完整的是【今年Q2】
-        return str(year), "2"
+        quarter = 2
     else:
-        # 11-12月：三季报已出完，最完整的是【今年Q3】
-        return str(year), "3"
-
-def load_blacklist():
-    if not os.path.exists(BLACKLIST_FILE): return set()
-    with open(BLACKLIST_FILE, 'r', encoding='utf-8') as f:
-        return set(line.strip() for line in f if line.strip())
-
-def load_completed():
-    if not os.path.exists(COMPLETED_FILE): return {}
-    completed = {}
-    now = datetime.now()
-    if os.path.exists(COMPLETED_FILE):
-        with open(COMPLETED_FILE, 'r', encoding='utf-8') as f:
-            for line in f:
-                parts = line.strip().split(',')
-                if len(parts) == 2:
-                    code, ts_str = parts
-                    try:
-                        ts = datetime.fromisoformat(ts_str)
-                        if (now - ts).days <= EXPIRE_DAYS: completed[code] = ts
-                    except: pass
-    return completed
-
-def init_financial_table():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS financial_factors (
-            code TEXT, stat_date TEXT, pub_date TEXT,
-            roe_avg REAL, yoy_profit_growth REAL, np_margin REAL,
-            gp_margin REAL, eps_ttm REAL, net_profit REAL,
-            mb_revenue REAL, 
-            liability_ratio REAL, cash_flow REAL, 
-            update_date TEXT,
-            PRIMARY KEY (code, stat_date, pub_date)
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-def worker_init():
-    bs.login()
-
-def fetch_single_stock(code):
-    try:
-        # 💥 动态获取最新财报季
-        year, quarter = get_latest_financial_quarter()
+        quarter = 3
         
+    results = []
+    checks = 0
+    max_checks = num_quarters + 4 
+    
+    while len(results) < num_quarters and checks < max_checks:
         profit_df = bs.query_profit_data(code=code, year=year, quarter=quarter).get_data()
-        growth_df = bs.query_growth_data(code=code, year=year, quarter=quarter).get_data()
-        balance_df = bs.query_balance_data(code=code, year=year, quarter=quarter).get_data()
-        cash_df = bs.query_cash_flow_data(code=code, year=year, quarter=quarter).get_data()
+        
+        if profit_df is not None and not profit_df.empty:
+            growth_df = bs.query_growth_data(code=code, year=year, quarter=quarter).get_data()
+            operation_df = bs.query_operation_data(code=code, year=year, quarter=quarter).get_data()
+            cash_flow_df = bs.query_cash_flow_data(code=code, year=year, quarter=quarter).get_data()
+            
+            def safe_float(df, col, default=0.0):
+                if df is not None and not df.empty and col in df.columns:
+                    val = df[col].iloc[0]
+                    try: return float(val) if val else default
+                    except: return default
+                return default
 
-        if not profit_df.empty:
-            p = profit_df.iloc[0]
-            g = growth_df.iloc[0] if not growth_df.empty else {}
-            b = balance_df.iloc[0] if not balance_df.empty else {}
-            c = cash_df.iloc[0] if not cash_df.empty else {}
+            def safe_str(df, col, default=""):
+                if df is not None and not df.empty and col in df.columns:
+                    val = df[col].iloc[0]
+                    return str(val) if val else default
+                return default
+            
+            net_profit = safe_float(profit_df, 'netProfit')
+            cfo_to_np = safe_float(cash_flow_df, 'CFOToNP')
+            cash_flow = net_profit * cfo_to_np if cfo_to_np != 0 else 0.0
+                
+            data = {
+                'stat_date': safe_str(profit_df, 'statDate'),
+                'pub_date': safe_str(profit_df, 'pubDate'),
+                'update_date': now.strftime('%Y-%m-%d %H:%M:%S'), 
+                'roe_avg': safe_float(profit_df, 'roeAvg'),
+                'yoy_profit_growth': safe_float(growth_df, 'YOYNI'),
+                'net_profit': net_profit,
+                'eps_ttm': safe_float(profit_df, 'epsTTM'),
+                'cash_flow': cash_flow,
+                'mb_revenue': safe_float(profit_df, 'MBRevenue'),
+                'total_share': safe_float(profit_df, 'totalShare'),
+                'liability_ratio': safe_float(profit_df, 'liabRatio'),
+                'gp_margin': safe_float(profit_df, 'gpMargin'),     
+                'np_margin': safe_float(profit_df, 'npMargin'),        
+                'cfo_to_np': cfo_to_np,       
+                'cfo_to_gr': safe_float(cash_flow_df, 'CFOToGr'),       
+                'inv_turn_days': safe_float(operation_df, 'INVTurnDays'), 
+                'nr_turn_days': safe_float(operation_df, 'NRTurnDays'),   
+                'yoy_pni': safe_float(growth_df, 'YOYPNI')              
+            }
+            results.append(data)
+            
+        quarter -= 1
+        if quarter == 0:
+            quarter = 4
+            year -= 1
+        checks += 1
+        
+    return results
 
-            roe_val = float(p.get('roeAvg', 0) or 0)
-            net_profit_val = float(p.get('netProfit', 0) or 0)
-            cfo_ratio = float(c.get('CFOToNP', 0) or 0)
-
-            # 严格按照列名顺序打包 tuple (共13个)
-            data_tuple = (
-                code, p.get('statDate', '未知'), p.get('pubDate', '未知'),
-                roe_val, 
-                float(g.get('YOYPNI', 0) or 0), 
-                float(p.get('npMargin', 0) or 0),
-                float(p.get('gpMargin', 0) or 0),
-                float(p.get('epsTTM', 0) or 0), 
-                net_profit_val,
-                float(p.get('MBRevenue', 0) or 0),
-                # 将 Baostock 错误的 0.003173 放大 100 倍，还原成正常的 0.3173 (即 31.73%)
-                float(b.get('liabilityToAsset', 0) or 0) * 100,
-                net_profit_val * cfo_ratio,                   # ✅ 推算出现金流绝对值
-                datetime.now().strftime('%Y-%m-%d %H:%M:%S') 
-            )
-            return {'code': code, 'status': 'success', 'data': data_tuple, 'roe': roe_val}
-        return {'code': code, 'status': 'no_data'}
-    except Exception as e:
-        return {'code': code, 'status': 'error', 'msg': str(e)}
-
-def sync_financial_factors(limit=None):
-    init_financial_table()
-    blacklist = load_blacklist()
-    completed = load_completed() 
-    
-    conn = sqlite3.connect(DB_PATH)
-    recent_date = (datetime.now() - timedelta(days=ACTIVE_DAYS)).strftime('%Y-%m-%d')
-    active_df = pd.read_sql_query(f"SELECT DISTINCT code FROM daily_k_data WHERE date >= '{recent_date}' AND volume > 0", conn)
-    
-    # 💥 终极修复：保持最纯净的沪深主板、科创板、创业板。彻底屏蔽北交所 (bj) 和深市指数！
-    valid_prefixes = ('sh.6', 'sz.00', 'sz.30')
-    
-    stock_codes = [
-        c for c in active_df['code'].tolist() 
-        if c not in blacklist 
-        and c not in completed
-        and c.startswith(valid_prefixes)  
-    ]
-    
-    if limit: stock_codes = stock_codes[:limit]
-    total_tasks = len(stock_codes)
-    if total_tasks == 0:
-        print("✅ 财务数据已是最新，无需处理。")
-        conn.close()
+def run_factor_sync(auto_confirm=False):
+    """主入口：带有断点续传、过期检测与人工确认的财务同步引擎"""
+    lg = bs.login()
+    if lg.error_code != '0':
+        print(f"Baostock 登录失败: {lg.error_msg}")
         return
 
-    print(f"🚀 启动 {PROCESS_COUNT} 个进程，拉取 {total_tasks} 只正规沪深 A 股财务数据 (已彻底过滤指数与北交所)...")
+    init_db()
+
+    print("📡 正在获取 A股 股票列表...")
+    rs = bs.query_stock_basic()
+    stock_list = []
+    while (rs.error_code == '0') and rs.next():
+        row = rs.get_row_data()
+        code = row[0]
+        if code.startswith(('sh.6', 'sz.0', 'sz.3')):
+            stock_list.append(code)
+
+    progress = load_progress()
+    now = datetime.now()
+    
+    todo_list = []
+    for code in stock_list:
+        if code in progress:
+            try:
+                last_sync_time = datetime.strptime(progress[code], "%Y-%m-%d %H:%M:%S")
+                if (now - last_sync_time).days > EXPIRE_DAYS:
+                    todo_list.append(code)
+            except ValueError:
+                todo_list.append(code) 
+        else:
+            todo_list.append(code)
+
+    total = len(todo_list)
+    if total == 0:
+        print("✅ 所有财务数据均在有效期内，无需更新。")
+        bs.logout()
+        return
+
+    print(f"\n📊 审计完毕：共有 {total} 只股票的财务数据缺失或已过期（>{EXPIRE_DAYS}天）。")
+    
+    if not auto_confirm:
+        user_input = input("❓ 是否开始更新全量 12 季度财报？首次更新时间可能较长 [默认回车继续] (Y/n): ")
+        if user_input.strip().lower() == 'n':
+            print("🛑 已取消财务更新。")
+            bs.logout()
+            return
+
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     start_time = time.time()
-    
-    # 💥 显式指定列名，彻底无视数据库物理字段顺序
-    insert_sql = """
-        INSERT OR REPLACE INTO financial_factors 
-        (code, stat_date, pub_date, roe_avg, yoy_profit_growth, np_margin, 
-         gp_margin, eps_ttm, net_profit, mb_revenue, liability_ratio, cash_flow, update_date) 
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """
-    
-    # 改为 'a' (追加模式)，保护已完成的断点记录不被清空
-    with open(COMPLETED_FILE, 'a', encoding='utf-8') as f_comp: 
-        with Pool(processes=PROCESS_COUNT, initializer=worker_init) as pool:
-            for idx, result in enumerate(pool.imap_unordered(fetch_single_stock, stock_codes), 1):
-                if result['status'] == 'success':
-                    cursor.execute(insert_sql, result['data'])
-                    conn.commit()
-                    f_comp.write(f"{result['code']},{datetime.now().isoformat()}\n")
-                    f_comp.flush()
-                    res_msg = f"✅ ROE: {result['roe']:.2f}"
-                elif result['status'] == 'no_data':
-                    res_msg = "⚠️ 暂无财报数据"
-                else:
-                    res_msg = f"❌ 错误: {result['msg'][:20]}"
+
+    for idx, code in enumerate(todo_list):
+        if idx > 0:
+            elapsed = time.time() - start_time
+            avg_time = elapsed / idx
+            eta_seconds = avg_time * (total - idx)
+            eta_str = time.strftime('%H:%M:%S', time.gmtime(eta_seconds))
+        else:
+            eta_str = "计算中..."
+
+        print(f"[{idx+1}/{total} | ETA: {eta_str}] 同步时序财报护城河: {code} ...", end=" ", flush=True)
+        try:
+            records = fetch_historical_financial_data(code, num_quarters=FINANCIAL_QUARTERS)
+            if records:
+                for rec in records:
+                    # 按照确定好的静态 Schema 写入数据
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO financial_factors (
+                            code, stat_date, pub_date, update_date, roe_avg, yoy_profit_growth, net_profit, 
+                            eps_ttm, cash_flow, mb_revenue, total_share, liability_ratio,
+                            gp_margin, np_margin, cfo_to_np, cfo_to_gr,
+                            inv_turn_days, nr_turn_days, yoy_pni
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        code, rec['stat_date'], rec['pub_date'], rec['update_date'], rec['roe_avg'], rec['yoy_profit_growth'], rec['net_profit'],
+                        rec['eps_ttm'], rec['cash_flow'], rec['mb_revenue'], rec['total_share'], rec['liability_ratio'],
+                        rec['gp_margin'], rec['np_margin'], rec['cfo_to_np'], rec['cfo_to_gr'],
+                        rec['inv_turn_days'], rec['nr_turn_days'], rec['yoy_pni']
+                    ))
+                conn.commit()
+                print(f"✅ 提取 {len(records)} 季")
+            else:
+                print("⚠️ 暂无数据")
+            
+            progress[code] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            save_progress(progress)
                 
-                # 打印进度
-                elapsed = time.time() - start_time
-                eta = str(timedelta(seconds=int((elapsed/idx)*(total_tasks-idx))))
-                print(f"[{idx}/{total_tasks}] {result['code']} {res_msg} | ETA: {eta}")
-    
+        except Exception as e:
+            print(f"❌ 失败: {e}")
+            
     conn.close()
     bs.logout()
+    print("🎉 全市场时序财务护城河数据更新完毕！")
 
-# ==========================================
-# 🌟 暴露给 main.py 的统一入口 (带交互确认)
-# ==========================================
-def run_factor_sync():
-    """带交互确认的同步入口"""
-    try:
-        user_input = input("\n>> 是否更新全量财务数据？(这将会全量覆盖以补充新指标) (Y/n) [默认Y]: ").strip().lower()
-        if user_input in ['', 'y', 'yes']:
-            sync_financial_factors()
-        else:
-            print("⏭️ 跳过财务因子同步。")
-    except KeyboardInterrupt:
-        print("\n👋 用户取消同步。")
-        sys.exit(0)
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--limit', type=int, default=None)
-    args = parser.parse_args()
-    run_factor_sync()
+if __name__ == '__main__':
+    run_factor_sync(auto_confirm=False)

@@ -17,3 +17,4 @@ quant_data.db-shm
 quant_data.db-wal
 .vscode/
 test.py
+completed_financial_codes.txt
