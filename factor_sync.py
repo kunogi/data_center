@@ -4,10 +4,47 @@ import pandas as pd
 from datetime import datetime
 import os
 import time
-import re  # 💥 引入正则库，用于清洗 Baostock 的脏数据
+import re  
 
 # 💥 快速失败机制：直接强制导入，如果缺少配置直接报错阻断，拒绝产生幽灵数据
 from config import DB_PATH, FINANCIAL_QUARTERS, COMPLETED_FILE, EXPIRE_DAYS
+
+# ==========================================
+# 🛠️ 辅助魔法：时序集合换算
+# ==========================================
+def stat_date_to_yq(date_str):
+    """将 stat_date ('2024-09-30') 转换为 (2024, 3) 的格式"""
+    try:
+        dt = datetime.strptime(date_str, '%Y-%m-%d')
+        return (dt.year, (dt.month - 1) // 3 + 1)
+    except:
+        return None
+
+def get_target_quarters(num_quarters=FINANCIAL_QUARTERS):
+    """生成我们【期望拥有】的完美 12 季度集合"""
+    now = datetime.now()
+    year = now.year
+    month = now.month
+    
+    # 按照当前的物理时间，推断最新的合理财报季
+    if month <= 4: 
+        year -= 1
+        quarter = 4
+    elif month <= 8:
+        quarter = 1
+    elif month <= 10:
+        quarter = 2
+    else:
+        quarter = 3
+        
+    targets = set()
+    for _ in range(num_quarters):
+        targets.add((year, quarter))
+        quarter -= 1
+        if quarter == 0:
+            quarter = 4
+            year -= 1
+    return targets
 
 def init_db():
     """💥 静态化数据结构：一次性建表，包含财务事实表与基础维度表"""
@@ -42,7 +79,7 @@ def init_db():
         )
     ''')
     
-    # 2. 创建股票基础信息维度表 (星型模型架构核心)
+    # 2. 创建股票基础信息维度表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS stock_basic (
             code TEXT PRIMARY KEY,
@@ -67,29 +104,24 @@ def sync_stock_basic():
     basic_data = []
     while rs.next():
         row = rs.get_row_data()
-        # Baostock 原生 row: [updateDate, code, code_name, industry(含代码的脏数据), industryClassification(废话)]
         code = row[1]
         if code.startswith(('sh.6', 'sz.0', 'sz.3')):
             name = row[2]
-            raw_industry = row[3]  # 例如: "J66货币金融服务"
+            raw_industry = row[3] 
             
-            # 💥 数据清洗：用正则分离行业代码 (字母+数字) 和纯中文行业名
             match = re.match(r'^([A-Za-z0-9]+)(.*)$', raw_industry)
             if match:
-                ind_code = match.group(1)   # 提取出 "J66"
-                ind_name = match.group(2)   # 提取出 "货币金融服务"
+                ind_code = match.group(1) 
+                ind_name = match.group(2) 
             else:
                 ind_code = "未知"
                 ind_name = raw_industry if raw_industry else "未知"
                 
-            # 我们直接废弃 Baostock 返回的废话 "证监会行业分类"
-            # 将纯净的中文名存入 industry，将提取的代码存入 industry_classification
             basic_data.append((code, name, ind_name, ind_code))
 
     if basic_data:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        # 使用 REPLACE，如果有股票改名或者行业变更，自动热更新
         cursor.executemany('''
             INSERT OR REPLACE INTO stock_basic (code, name, industry, industry_classification)
             VALUES (?, ?, ?, ?)
@@ -99,7 +131,6 @@ def sync_stock_basic():
         print(f"✅ 成功更新 {len(basic_data)} 只股票的基础行业画像！数据已极致净化。")
 
 def load_progress():
-    """读取带有时间戳的断点续传记录"""
     progress = {}
     if os.path.exists(COMPLETED_FILE):
         with open(COMPLETED_FILE, "r", encoding="utf-8") as f:
@@ -114,32 +145,17 @@ def load_progress():
     return progress
 
 def save_progress(progress_dict):
-    """保存进度与时间戳"""
     with open(COMPLETED_FILE, "w", encoding="utf-8") as f:
         for code, ts in progress_dict.items():
             f.write(f"{code},{ts}\n")
 
-def fetch_historical_financial_data(code, num_quarters=FINANCIAL_QUARTERS):
-    """提取过去 N 个季度的完整财务与护城河指标"""
+def fetch_specific_financial_quarters(code, quarters_set):
+    """💥 魔法升级：抛弃盲目循环，精准狙击 missing_set 中缺失的季度"""
     now = datetime.now()
-    year = now.year
-    month = now.month
-    
-    if month <= 4: 
-        year -= 1
-        quarter = 4
-    elif month <= 8:
-        quarter = 1
-    elif month <= 10:
-        quarter = 2
-    else:
-        quarter = 3
-        
     results = []
-    checks = 0
-    max_checks = num_quarters + 4 
     
-    while len(results) < num_quarters and checks < max_checks:
+    # 按照时间倒序抓取（从最新往最老）
+    for year, quarter in sorted(quarters_set, reverse=True):
         profit_df = bs.query_profit_data(code=code, year=year, quarter=quarter).get_data()
         
         if profit_df is not None and not profit_df.empty:
@@ -186,24 +202,16 @@ def fetch_historical_financial_data(code, num_quarters=FINANCIAL_QUARTERS):
             }
             results.append(data)
             
-        quarter -= 1
-        if quarter == 0:
-            quarter = 4
-            year -= 1
-        checks += 1
-        
     return results
 
 def run_factor_sync(auto_confirm=False):
-    """主入口：带有断点续传、过期检测与人工确认的财务同步引擎"""
+    """主入口：带有历史空洞探测、断点续传与防并击发的高级同步引擎"""
     lg = bs.login()
     if lg.error_code != '0':
         print(f"Baostock 登录失败: {lg.error_msg}")
         return
 
     init_db()
-    
-    # 💥 首先同步轻量级的静态基础维度数据
     sync_stock_basic()
 
     print("📡 正在获取 A股 股票列表...")
@@ -215,41 +223,85 @@ def run_factor_sync(auto_confirm=False):
         if code.startswith(('sh.6', 'sz.0', 'sz.3')):
             stock_list.append(code)
 
+    # ==========================================
+    # 💥 全盘空洞探测 (Set Difference Logic)
+    # ==========================================
+    print("📡 正在全盘扫描本地数据库，执行时空集合比对与空洞探测...")
+    target_set = get_target_quarters(FINANCIAL_QUARTERS)
+    
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df_existing = pd.read_sql_query("SELECT code, stat_date FROM financial_factors", conn)
+        db_inventory = {}
+        for _, row in df_existing.iterrows():
+            code = row['code']
+            yq = stat_date_to_yq(row['stat_date'])
+            if yq:
+                if code not in db_inventory:
+                    db_inventory[code] = set()
+                db_inventory[code].add(yq)
+    except Exception as e:
+        print("⚠️ 无法读取存量数据，将执行全量同步。")
+        db_inventory = {}
+
     progress = load_progress()
     now = datetime.now()
     
-    todo_list = []
+    todo_dict = {} # {code: set_of_missing_quarters}
+    
     for code in stock_list:
-        if code in progress:
+        existing_set = db_inventory.get(code, set())
+        missing_set = target_set - existing_set # 💥 核心：求差集
+        
+        last_sync_time = progress.get(code)
+        is_expired = True
+        if last_sync_time:
             try:
-                last_sync_time = datetime.strptime(progress[code], "%Y-%m-%d %H:%M:%S")
-                if (now - last_sync_time).days > EXPIRE_DAYS:
-                    todo_list.append(code)
-            except ValueError:
-                todo_list.append(code) 
-        else:
-            todo_list.append(code)
+                last_ts = datetime.strptime(last_sync_time, "%Y-%m-%d %H:%M:%S")
+                is_expired = (now - last_ts).days > EXPIRE_DAYS
+            except:
+                pass
+                
+        if missing_set:
+            needs_update = False
+            if is_expired:
+                # 过期了，且有数据缺失，必须查
+                needs_update = True
+            else:
+                # 💥 没过期，但我们必须检查是不是有“历史空洞”（如手残删除了中间数据）
+                # 规则：如果缺的季度比已有的最新季度还要老，说明是真孔洞！强行修补！
+                if existing_set:
+                    max_existing = max(existing_set)
+                    if any(mq < max_existing for mq in missing_set):
+                        needs_update = True
+            
+            if needs_update:
+                todo_dict[code] = missing_set
 
-    total = len(todo_list)
+    total = len(todo_dict)
     if total == 0:
-        print("✅ 所有财务数据均在有效期内，无需更新。")
+        print("✅ 全盘数据完美连续，且均在有效期内，无任何历史空洞！")
+        conn.close()
         bs.logout()
         return
 
-    print(f"\n📊 审计完毕：共有 {total} 只股票的财务数据缺失或已过期（>{EXPIRE_DAYS}天）。")
+    print(f"\n📊 审计完毕：发现 {total} 只股票存在历史空洞或数据过期。")
     
     if not auto_confirm:
-        user_input = input("❓ 是否开始更新全量 12 季度财报？首次更新时间可能较长 [默认回车继续] (Y/n): ")
+        user_input = input("❓ 是否开始定点填补空洞与更新？ [默认回车继续] (Y/n): ")
         if user_input.strip().lower() == 'n':
             print("🛑 已取消财务更新。")
+            conn.close()
             bs.logout()
             return
 
-    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     start_time = time.time()
 
-    for idx, code in enumerate(todo_list):
+    # 将字典转为列表以便遍历
+    todo_items = list(todo_dict.items())
+
+    for idx, (code, missing_quarters) in enumerate(todo_items):
         if idx > 0:
             elapsed = time.time() - start_time
             avg_time = elapsed / idx
@@ -258,9 +310,9 @@ def run_factor_sync(auto_confirm=False):
         else:
             eta_str = "计算中..."
 
-        print(f"[{idx+1}/{total} | ETA: {eta_str}] 同步时序财报护城河: {code} ...", end=" ", flush=True)
+        print(f"[{idx+1}/{total} | ETA: {eta_str}] 填补空洞 {code} (需补 {len(missing_quarters)} 季)...", end=" ", flush=True)
         try:
-            records = fetch_historical_financial_data(code, num_quarters=FINANCIAL_QUARTERS)
+            records = fetch_specific_financial_quarters(code, quarters_set=missing_quarters)
             if records:
                 for rec in records:
                     cursor.execute('''
@@ -277,10 +329,11 @@ def run_factor_sync(auto_confirm=False):
                         rec['inv_turn_days'], rec['nr_turn_days'], rec['yoy_pni']
                     ))
                 conn.commit()
-                print(f"✅ 提取 {len(records)} 季")
+                print(f"✅ 成功补入 {len(records)} 季")
             else:
-                print("⚠️ 暂无数据")
+                print("⚠️ 暂无发布数据")
             
+            # 只有在过期时，或者成功填补时才刷新进度时间戳
             progress[code] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             save_progress(progress)
                 
@@ -289,7 +342,7 @@ def run_factor_sync(auto_confirm=False):
             
     conn.close()
     bs.logout()
-    print("🎉 全市场时序财务护城河数据更新完毕！")
+    print("🎉 全市场历史空洞填补与财务护城河更新完毕！")
 
 if __name__ == '__main__':
     run_factor_sync(auto_confirm=False)
