@@ -1,7 +1,7 @@
 import baostock as bs
 import sqlite3
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import time
 import re  
@@ -26,7 +26,6 @@ def get_target_quarters(num_quarters=FINANCIAL_QUARTERS):
     year = now.year
     month = now.month
     
-    # 按照当前的物理时间，推断最新的合理财报季
     if month <= 4: 
         year -= 1
         quarter = 4
@@ -47,56 +46,29 @@ def get_target_quarters(num_quarters=FINANCIAL_QUARTERS):
     return targets
 
 def init_db():
-    """💥 静态化数据结构：一次性建表，包含财务事实表与基础维度表"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
-    # 1. 创建财务因子事实表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS financial_factors (
-            code TEXT,
-            stat_date TEXT,
-            pub_date TEXT,
-            roe_avg REAL,
-            yoy_profit_growth REAL,
-            np_margin REAL,
-            gp_margin REAL,
-            eps_ttm REAL,
-            net_profit REAL,
-            mb_revenue REAL,
-            update_date TEXT, 
-            liability_ratio REAL, 
-            cash_flow REAL, 
-            gross_margin REAL, 
-            net_margin REAL, 
-            cfo_to_np REAL, 
-            cfo_to_gr REAL, 
-            inv_turn_days REAL, 
-            nr_turn_days REAL, 
-            yoy_pni REAL, 
-            total_share REAL,
+            code TEXT, stat_date TEXT, pub_date TEXT, roe_avg REAL, yoy_profit_growth REAL,
+            np_margin REAL, gp_margin REAL, eps_ttm REAL, net_profit REAL, mb_revenue REAL,
+            update_date TEXT, liability_ratio REAL, cash_flow REAL, gross_margin REAL, 
+            net_margin REAL, cfo_to_np REAL, cfo_to_gr REAL, inv_turn_days REAL, 
+            nr_turn_days REAL, yoy_pni REAL, total_share REAL,
             PRIMARY KEY (code, stat_date, pub_date)
         )
     ''')
-    
-    # 2. 创建股票基础信息维度表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS stock_basic (
-            code TEXT PRIMARY KEY,
-            name TEXT,
-            industry TEXT,
-            industry_classification TEXT
+            code TEXT PRIMARY KEY, name TEXT, industry TEXT, industry_classification TEXT
         )
     ''')
-    
     conn.commit()
     conn.close()
 
 def sync_stock_basic():
-    """💥 毫秒级雷达：同步全市场股票的基础静态信息 (自带脏数据清洗过滤)"""
     print("📡 正在同步全市场股票基础信息(行业分类)...")
     rs = bs.query_stock_industry()
-    
     if rs.error_code != '0':
         print(f"⚠️ 行业信息获取失败: {rs.error_msg}")
         return
@@ -108,7 +80,6 @@ def sync_stock_basic():
         if code.startswith(('sh.6', 'sz.0', 'sz.3')):
             name = row[2]
             raw_industry = row[3] 
-            
             match = re.match(r'^([A-Za-z0-9]+)(.*)$', raw_industry)
             if match:
                 ind_code = match.group(1) 
@@ -116,7 +87,6 @@ def sync_stock_basic():
             else:
                 ind_code = "未知"
                 ind_name = raw_industry if raw_industry else "未知"
-                
             basic_data.append((code, name, ind_name, ind_code))
 
     if basic_data:
@@ -128,7 +98,7 @@ def sync_stock_basic():
         ''', basic_data)
         conn.commit()
         conn.close()
-        print(f"✅ 成功更新 {len(basic_data)} 只股票的基础行业画像！数据已极致净化。")
+        print(f"✅ 成功更新 {len(basic_data)} 只股票的基础行业画像！")
 
 def load_progress():
     progress = {}
@@ -138,10 +108,8 @@ def load_progress():
                 line = line.strip()
                 if not line: continue
                 parts = line.split(',')
-                if len(parts) >= 2:
-                    progress[parts[0]] = parts[1]
-                else:
-                    progress[parts[0]] = "2000-01-01 00:00:00"
+                if len(parts) >= 2: progress[parts[0]] = parts[1]
+                else: progress[parts[0]] = "2000-01-01 00:00:00"
     return progress
 
 def save_progress(progress_dict):
@@ -150,11 +118,9 @@ def save_progress(progress_dict):
             f.write(f"{code},{ts}\n")
 
 def fetch_specific_financial_quarters(code, quarters_set):
-    """💥 魔法升级：抛弃盲目循环，精准狙击 missing_set 中缺失的季度"""
     now = datetime.now()
     results = []
     
-    # 按照时间倒序抓取（从最新往最老）
     for year, quarter in sorted(quarters_set, reverse=True):
         profit_df = bs.query_profit_data(code=code, year=year, quarter=quarter).get_data()
         
@@ -205,7 +171,6 @@ def fetch_specific_financial_quarters(code, quarters_set):
     return results
 
 def run_factor_sync(auto_confirm=False):
-    """主入口：带有历史空洞探测、断点续传与防并击发的高级同步引擎"""
     lg = bs.login()
     if lg.error_code != '0':
         print(f"Baostock 登录失败: {lg.error_msg}")
@@ -223,9 +188,6 @@ def run_factor_sync(auto_confirm=False):
         if code.startswith(('sh.6', 'sz.0', 'sz.3')):
             stock_list.append(code)
 
-    # ==========================================
-    # 💥 全盘空洞探测 (Set Difference Logic)
-    # ==========================================
     print("📡 正在全盘扫描本地数据库，执行时空集合比对与空洞探测...")
     target_set = get_target_quarters(FINANCIAL_QUARTERS)
     
@@ -246,12 +208,22 @@ def run_factor_sync(auto_confirm=False):
 
     progress = load_progress()
     now = datetime.now()
-    
-    todo_dict = {} # {code: set_of_missing_quarters}
+    todo_dict = {} 
     
     for code in stock_list:
         existing_set = db_inventory.get(code, set())
-        missing_set = target_set - existing_set # 💥 核心：求差集
+        missing_set = target_set - existing_set 
+        
+        # 🛡️ 核心：【次新股免疫盾】
+        # 如果我们手里已经有了它的财报，那么它最老的那份财报季度，就是它的“物理边界”。
+        # 我们无条件抛弃 missing_set 中所有比它还要老的季度（史前数据）。
+        if existing_set:
+            min_existing = min(existing_set)
+            # 利用元组比较特性 (2023, 2) >= (2023, 1) 进行完美降维拦截
+            missing_set = {mq for mq in missing_set if mq >= min_existing}
+            
+        if not missing_set:
+            continue # 如果抛弃史前数据后，啥也不缺了，直接放行次新股！
         
         last_sync_time = progress.get(code)
         is_expired = True
@@ -259,33 +231,57 @@ def run_factor_sync(auto_confirm=False):
             try:
                 last_ts = datetime.strptime(last_sync_time, "%Y-%m-%d %H:%M:%S")
                 is_expired = (now - last_ts).days > EXPIRE_DAYS
-            except:
-                pass
+            except: pass
                 
-        if missing_set:
-            needs_update = False
-            if is_expired:
-                # 过期了，且有数据缺失，必须查
-                needs_update = True
-            else:
-                # 💥 没过期，但我们必须检查是不是有“历史空洞”（如手残删除了中间数据）
-                # 规则：如果缺的季度比已有的最新季度还要老，说明是真孔洞！强行修补！
-                if existing_set:
-                    max_existing = max(existing_set)
-                    if any(mq < max_existing for mq in missing_set):
-                        needs_update = True
+        needs_update = False
+        if is_expired:
+            needs_update = True
+        else:
+            # 没过期时，检测“内部真空洞”（比如不小心删除了中间一个季度的记录）
+            if existing_set:
+                min_existing = min(existing_set)
+                max_existing = max(existing_set)
+                if any(min_existing < mq < max_existing for mq in missing_set):
+                    needs_update = True
+                    
+        if needs_update:
+            todo_dict[code] = missing_set
+
+    # 🩺 插入心跳检测网：彻底剥离僵尸股
+    if todo_dict:
+        print(f"\n🩺 正在对 {len(todo_dict)} 只嫌疑空洞股进行【心跳存活检测】...")
+        cutoff_date = (datetime.now() - timedelta(days=15)).strftime('%Y-%m-%d')
+        codes_to_check = list(todo_dict.keys())
+        alive_codes = set()
+        
+        chunk_size = 900
+        for i in range(0, len(codes_to_check), chunk_size):
+            chunk = codes_to_check[i:i+chunk_size]
+            placeholders = ','.join('?' for _ in chunk)
+            query = f"SELECT DISTINCT code FROM daily_k_data WHERE date >= ? AND volume > 0 AND code IN ({placeholders})"
+            try:
+                alive_df = pd.read_sql_query(query, conn, params=[cutoff_date] + chunk)
+                alive_codes.update(alive_df['code'].tolist())
+            except Exception: pass
+                
+        zombies = [c for c in codes_to_check if c not in alive_codes]
+        print(f"💀 过滤结果: 成功剔除 {len(zombies)} 只已退市或长期停牌的【僵尸股】！")
+        
+        # 喂给僵尸股时间戳，未来 EXPIRE_DAYS 天内不再诈尸
+        for z_code in zombies:
+            progress[z_code] = now.strftime("%Y-%m-%d %H:%M:%S")
+        if zombies: save_progress(progress)
             
-            if needs_update:
-                todo_dict[code] = missing_set
+        todo_dict = {code: quarters for code, quarters in todo_dict.items() if code in alive_codes}
 
     total = len(todo_dict)
     if total == 0:
-        print("✅ 全盘数据完美连续，且均在有效期内，无任何历史空洞！")
+        print("✅ 全盘数据完美连续 (已智能豁免次新股与僵尸股)，无历史空洞！")
         conn.close()
         bs.logout()
         return
 
-    print(f"\n📊 审计完毕：发现 {total} 只股票存在历史空洞或数据过期。")
+    print(f"\n📊 审计完毕：排雷后共 {total} 只活股确实需要更新。")
     
     if not auto_confirm:
         user_input = input("❓ 是否开始定点填补空洞与更新？ [默认回车继续] (Y/n): ")
@@ -297,20 +293,16 @@ def run_factor_sync(auto_confirm=False):
 
     cursor = conn.cursor()
     start_time = time.time()
-
-    # 将字典转为列表以便遍历
     todo_items = list(todo_dict.items())
 
     for idx, (code, missing_quarters) in enumerate(todo_items):
         if idx > 0:
             elapsed = time.time() - start_time
-            avg_time = elapsed / idx
-            eta_seconds = avg_time * (total - idx)
+            eta_seconds = (elapsed / idx) * (total - idx)
             eta_str = time.strftime('%H:%M:%S', time.gmtime(eta_seconds))
-        else:
-            eta_str = "计算中..."
+        else: eta_str = "计算中..."
 
-        print(f"[{idx+1}/{total} | ETA: {eta_str}] 填补空洞 {code} (需补 {len(missing_quarters)} 季)...", end=" ", flush=True)
+        print(f"[{idx+1}/{total} | ETA: {eta_str}] 填补 {code} (需补 {len(missing_quarters)} 季)...", end=" ", flush=True)
         try:
             records = fetch_specific_financial_quarters(code, quarters_set=missing_quarters)
             if records:
@@ -333,12 +325,9 @@ def run_factor_sync(auto_confirm=False):
             else:
                 print("⚠️ 暂无发布数据")
             
-            # 只有在过期时，或者成功填补时才刷新进度时间戳
             progress[code] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             save_progress(progress)
-                
-        except Exception as e:
-            print(f"❌ 失败: {e}")
+        except Exception as e: print(f"❌ 失败: {e}")
             
     conn.close()
     bs.logout()
