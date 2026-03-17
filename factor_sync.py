@@ -215,36 +215,26 @@ def run_factor_sync(auto_confirm=False):
         missing_set = target_set - existing_set 
         
         # 🛡️ 核心：【次新股免疫盾】
-        # 如果我们手里已经有了它的财报，那么它最老的那份财报季度，就是它的“物理边界”。
-        # 我们无条件抛弃 missing_set 中所有比它还要老的季度（史前数据）。
         if existing_set:
             min_existing = min(existing_set)
-            # 利用元组比较特性 (2023, 2) >= (2023, 1) 进行完美降维拦截
             missing_set = {mq for mq in missing_set if mq >= min_existing}
             
         if not missing_set:
-            continue # 如果抛弃史前数据后，啥也不缺了，直接放行次新股！
+            continue 
         
         last_sync_time = progress.get(code)
         is_expired = True
         if last_sync_time:
             try:
                 last_ts = datetime.strptime(last_sync_time, "%Y-%m-%d %H:%M:%S")
-                is_expired = (now - last_ts).days > EXPIRE_DAYS
+                # 只要距离上次尝试的时间不超过冷却期，就一律判定为没过期
+                is_expired = (now - last_ts).days >= EXPIRE_DAYS
             except: pass
                 
-        needs_update = False
+        # 💥 【彻底消灭死循环】: 
+        # 只有真正过期了（超过 EXPIRE_DAYS 未更新过）的股票，才允许被加入网络请求队列。
+        # 无论它是内部空洞还是次新股缺失，只要还在冷却期内，直接无视！
         if is_expired:
-            needs_update = True
-        else:
-            # 没过期时，检测“内部真空洞”（比如不小心删除了中间一个季度的记录）
-            if existing_set:
-                min_existing = min(existing_set)
-                max_existing = max(existing_set)
-                if any(min_existing < mq < max_existing for mq in missing_set):
-                    needs_update = True
-                    
-        if needs_update:
             todo_dict[code] = missing_set
 
     # 🩺 插入心跳检测网：彻底剥离僵尸股
@@ -267,7 +257,7 @@ def run_factor_sync(auto_confirm=False):
         zombies = [c for c in codes_to_check if c not in alive_codes]
         print(f"💀 过滤结果: 成功剔除 {len(zombies)} 只已退市或长期停牌的【僵尸股】！")
         
-        # 喂给僵尸股时间戳，未来 EXPIRE_DAYS 天内不再诈尸
+        # 喂给僵尸股时间戳，未来冷却期内不再诈尸
         for z_code in zombies:
             progress[z_code] = now.strftime("%Y-%m-%d %H:%M:%S")
         if zombies: save_progress(progress)
@@ -276,7 +266,7 @@ def run_factor_sync(auto_confirm=False):
 
     total = len(todo_dict)
     if total == 0:
-        print("✅ 全盘数据完美连续 (已智能豁免次新股与僵尸股)，无历史空洞！")
+        print("✅ 本地数据检查完毕 (已智能豁免次新股、僵尸股及冷却期内的标的)，当前无需网络请求！")
         conn.close()
         bs.logout()
         return
@@ -325,6 +315,7 @@ def run_factor_sync(auto_confirm=False):
             else:
                 print("⚠️ 暂无发布数据")
             
+            # 无论成功失败，只要查过一次，就给它打上时间戳进入冷却期！
             progress[code] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             save_progress(progress)
         except Exception as e: print(f"❌ 失败: {e}")
