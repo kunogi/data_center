@@ -7,15 +7,7 @@ import os
 import sys
 from datetime import datetime, timedelta
 from multiprocessing import Pool, cpu_count
-
-try:
-    # 💥 引入被冷落已久的 DAILY_K_DAYS 参数
-    from config import DB_PATH, CORE_INDICES, BLACKLIST_FILE, DAILY_K_DAYS
-except ImportError:
-    DB_PATH = "quant_data.db"
-    BLACKLIST_FILE = "blacklist.txt"
-    DAILY_K_DAYS = 365
-    CORE_INDICES = ['sh.000001', 'sz.399001', 'sz.399107', 'sh.000300', 'sz.399006', 'sh.000905', 'sh.000852', 'bj.899050']
+from config import DB_PATH, CORE_INDICES, BLACKLIST_FILE, DAILY_K_DAYS
 
 def get_db_conn():
     return sqlite3.connect(DB_PATH)
@@ -28,52 +20,62 @@ def load_blacklist():
 def get_todo_list(target_date, blacklist):
     """【真·全市场动态对齐】通过花名册 Diff 机制，自动捕捉新股并彻底过滤垃圾指数"""
     conn = get_db_conn()
+    
+    # 1. 读取 K 线表已有进度 (断点续传核心)
     sql = "SELECT code, MAX(date) as max_date FROM daily_k_data GROUP BY code"
-    df_db = pd.read_sql_query(sql, conn)
-    db_progress = dict(zip(df_db['code'], df_db['max_date']))
+    try:
+        df_db = pd.read_sql_query(sql, conn)
+        db_progress = dict(zip(df_db['code'], df_db['max_date']))
+    except Exception:
+        db_progress = {} # 表不存在或为空时容错
+
+    # 2. 尝试：向交易所请求当日最新花名册
+    print(f"📡 正在向交易所请求 {target_date} 的全市场动态花名册...")
+    bs.login()
+    rs = bs.query_all_stock(day=target_date)
+    stock_list = []
+    while (rs.error_code == '0') and rs.next():
+        stock_list.append(rs.get_row_data()[0])
+    bs.logout()
+
+    # 💥 核心修复：双重降级保险！如果交易所抽风，直接读取本地 stock_basic 表！
+    if not stock_list:
+        print("⚠️ 花名册请求失败，智能降级为读取本地 stock_basic 画像库名单...")
+        try:
+            df_basic = pd.read_sql_query("SELECT code FROM stock_basic", conn)
+            stock_list = df_basic['code'].tolist()
+        except Exception:
+            stock_list = list(db_progress.keys()) # 终极兜底
+            
     conn.close()
 
-    print(f"📡 正在向交易所请求 {target_date} 的全市场动态花名册...")
-    bs.login() 
-    rs = bs.query_all_stock(day=target_date)
-    all_active_codes = []
+    # 3. 将核心指数和全市场股票合并，并执行【严格无菌清洗】
+    raw_roster = set(CORE_INDICES + stock_list)
+    full_roster = set()
     
-    # 💥 核心白名单：只放行沪深纯正A股
-    valid_prefixes = ('sh.6', 'sz.00', 'sz.30')
-    
-    while (rs.error_code == '0') and rs.next():
-        row = rs.get_row_data()
-        code = row[0]
-        if code.startswith(valid_prefixes) or code in CORE_INDICES:
-            all_active_codes.append(code)
-            
-    bs.logout()
-    
-    if not all_active_codes:
-        print("⚠️ 花名册请求失败，降级为本地存量更新模式...")
-        all_active_codes = [c for c in db_progress.keys() if c.startswith(valid_prefixes)] + CORE_INDICES
+    for c in raw_roster:
+        clean_c = str(c).strip()  # 🔪 第一刀：切掉所有的隐形回车和空格
+        # 🛡️ 第二刀：强制拦截！只有正好 9 位，且符合 xx.xxxxxx 格式的代码才准放行
+        if len(clean_c) == 9 and clean_c[2] == '.':
+            full_roster.add(clean_c)
 
-    todo_list = []
-    for code in all_active_codes:
-        # 💥 救命补丁：如果是 bj 或 399，必须检查它是不是 VIP 指数。只有不是 VIP 的才杀！
-        if (code.startswith('bj.') or code.startswith('sz.399')) and (code not in CORE_INDICES):
-            continue
-            
-        if code in blacklist:
-            continue
-            
+    # 4. 过滤黑名单
+    todo_list = [c for c in full_roster if c not in blacklist]
+    
+    tasks = []
+    for code in todo_list:
         last_date = db_progress.get(code)
-        if last_date is None or last_date < target_date:
-            todo_list.append(code)
+        if last_date:
+            start_date = (datetime.strptime(last_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+        else:
+            # 💥 触发：新股或 Drop Table 后，直接使用 3000 天极限深潜！
+            start_date = (datetime.now() - timedelta(days=DAILY_K_DAYS)).strftime('%Y-%m-%d')
             
-    # 保底：无论如何，VIP 指数必须检查
-    for idx in CORE_INDICES:
-        if idx not in todo_list and idx not in blacklist:
-            last_date = db_progress.get(idx)
-            if last_date is None or last_date < target_date:
-                todo_list.append(idx)
-
-    return list(set(todo_list))
+        # 防止越界：如果 start_date 还没超过 target_date，才需要更新
+        if start_date <= target_date:
+            tasks.append((code, start_date, target_date))
+            
+    return tasks
 
 def fetch_eastmoney_kline(code, start_date, end_date):
     """💥 专门为 Baostock 不支持的指数（如北证50）开的东方财富小灶"""
@@ -90,7 +92,7 @@ def fetch_eastmoney_kline(code, start_date, end_date):
         "klt": "101",
         "fqt": "1",
         "end": "20500101",
-        "lmt": "200"  # 拉取最近 200 天，足够覆盖各种断点
+        "lmt": "10000"  # 拉取最近 200 天，足够覆盖各种断点
     }
     headers = {"User-Agent": "Mozilla/5.0"}
     
@@ -158,28 +160,16 @@ def run_kline_sync():
     
     target_date = datetime.now().strftime('%Y-%m-%d')
     blacklist = load_blacklist()
-    todo_list = get_todo_list(target_date, blacklist)
     
-    if not todo_list:
+    # 这里的 tasks 已经是最终组装好的元组列表了！
+    tasks = get_todo_list(target_date, blacklist)
+    
+    if not tasks:
         print("✅ 所有 K 线数据均已是最新，无需同步。")
         conn.close()
         return
 
-    print(f"🚀 开始同步 {len(todo_list)} 只标的 K 线数据...")
-    
-    sql = "SELECT code, MAX(date) as max_date FROM daily_k_data GROUP BY code"
-    df_db = pd.read_sql_query(sql, conn)
-    db_progress = dict(zip(df_db['code'], df_db['max_date']))
-    
-    tasks = []
-    for code in todo_list:
-        last_date = db_progress.get(code)
-        if last_date:
-            start_date = (datetime.strptime(last_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
-        else:
-            # 💥 修复：不再硬编码 180 天，而是使用 config.py 中的 DAILY_K_DAYS 掌握最高控制权
-            start_date = (datetime.now() - timedelta(days=DAILY_K_DAYS)).strftime('%Y-%m-%d')
-        tasks.append((code, start_date, target_date))
+    print(f"🚀 开始同步 {len(tasks)} 只标的 K 线数据...")
         
     insert_sql = "INSERT OR REPLACE INTO daily_k_data VALUES (?,?,?,?,?,?,?,?,?,?)"
     process_count = min(8, cpu_count() * 2)
