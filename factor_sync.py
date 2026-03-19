@@ -210,9 +210,9 @@ def run_factor_sync(auto_confirm=False):
         missing_set = target_set - existing_set 
         
         # 🛡️ 核心：【次新股免疫盾】(跑完历史回测后，取消注释以恢复该功能)
-        # if existing_set:
-        #     min_existing = min(existing_set)
-        #     missing_set = {mq for mq in missing_set if mq >= min_existing}
+        if existing_set:
+            min_existing = min(existing_set)
+            missing_set = {mq for mq in missing_set if mq >= min_existing}
             
         if not missing_set: continue 
         
