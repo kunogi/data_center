@@ -1,0 +1,9 @@
+akshare==1.18.40
+baostock==0.8.9
+httpx==0.28.1
+numpy==2.4.3
+openai==2.29.0
+pandas==3.0.1
+protobuf==7.34.0
+python-dotenv==1.2.2
+Requests==2.32.5
