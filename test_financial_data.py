@@ -62,7 +62,8 @@ def audit_stock(code=None):
         df = pd.read_sql_query('''
             SELECT stat_date AS 财报季, pub_date AS 发布日,
                    net_profit AS 净利润, cash_flow AS 经营现金流,
-                   yoy_pni AS 扣非同增, yoy_profit_growth AS 净利同增,
+                   yoy_pni AS 归母净利同增,  
+                   yoy_profit_growth AS 总净利同增, 
                    gp_margin AS 毛利率, np_margin AS 净利率,
                    cfo_to_np AS 净利现金含量, 
                    inv_turn_days AS 存货周转天数, nr_turn_days AS 应收周转天数,
@@ -81,8 +82,8 @@ def audit_stock(code=None):
         # 4. 施加“同花顺视觉滤镜”
         df['净利润'] = df['净利润'].apply(format_money)
         df['经营现金流'] = df['经营现金流'].apply(format_money)
-        df['扣非同增'] = df['扣非同增'].apply(format_pct)
-        df['净利同增'] = df['净利同增'].apply(format_pct)
+        df['归母净利同增'] = df['归母净利同增'].apply(format_pct)
+        df['总净利同增'] = df['总净利同增'].apply(format_pct)
         df['毛利率'] = df['毛利率'].apply(format_pct)
         df['净利率'] = df['净利率'].apply(format_pct)
         df['ROE'] = df['ROE'].apply(format_pct)

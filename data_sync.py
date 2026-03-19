@@ -21,7 +21,7 @@ def get_todo_list(target_date, blacklist):
     """【真·全市场动态对齐】通过花名册 Diff 机制，自动捕捉新股并彻底过滤垃圾指数"""
     conn = get_db_conn()
     
-    # 1. 读取 K 线表已有进度 (断点续传核心)
+    # 1. 读取 K 线表已有进度 (断点续传与日常增量核心)
     sql = "SELECT code, MAX(date) as max_date FROM daily_k_data GROUP BY code"
     try:
         df_db = pd.read_sql_query(sql, conn)
@@ -54,8 +54,7 @@ def get_todo_list(target_date, blacklist):
     full_roster = set()
     
     for c in raw_roster:
-        clean_c = str(c).strip()  # 🔪 第一刀：切掉所有的隐形回车和空格
-        # 🛡️ 第二刀：强制拦截！只有正好 9 位，且符合 xx.xxxxxx 格式的代码才准放行
+        clean_c = str(c).strip()
         if len(clean_c) == 9 and clean_c[2] == '.':
             full_roster.add(clean_c)
 
@@ -66,9 +65,10 @@ def get_todo_list(target_date, blacklist):
     for code in todo_list:
         last_date = db_progress.get(code)
         if last_date:
+            # 🚀 日常增量绝技：直接从本地日期的下一天开始索要数据
             start_date = (datetime.strptime(last_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
         else:
-            # 💥 触发：新股或 Drop Table 后，直接使用 3000 天极限深潜！
+            # 如果是今天新上的 IPO 新股，往前回溯配置的天数
             start_date = (datetime.now() - timedelta(days=DAILY_K_DAYS)).strftime('%Y-%m-%d')
             
         # 防止越界：如果 start_date 还没超过 target_date，才需要更新
@@ -92,7 +92,7 @@ def fetch_eastmoney_kline(code, start_date, end_date):
         "klt": "101",
         "fqt": "1",
         "end": "20500101",
-        "lmt": "10000"  # 拉取最近 200 天，足够覆盖各种断点
+        "lmt": "10000"
     }
     headers = {"User-Agent": "Mozilla/5.0"}
     
@@ -114,7 +114,6 @@ def fetch_eastmoney_kline(code, start_date, end_date):
             vol, amount, pct_chg = parts[5], parts[6], parts[8]
             turn = parts[10] if parts[10] != '-' else '0'
             
-            # 严格对齐 daily_k_data 表结构: (date, code, open, high, low, close, volume, amount, turn, pctChg)
             result.append((date, code, open_val, high_val, low_val, close_val, vol, amount, turn, pct_chg))
         return result
     except Exception as e:
@@ -127,11 +126,9 @@ def worker_init():
 def sync_single_stock(args):
     code, start_date, end_date = args
     try:
-        # 💥 拦截分流：如果是北交所，走特权通道
         if code == 'bj.899050':
             data_list = fetch_eastmoney_kline(code, start_date, end_date)
         else:
-            # 正常 A股走 Baostock
             rs = bs.query_history_k_data_plus(
                 code,
                 "date,code,open,high,low,close,volume,amount,turn,pctChg",
@@ -161,38 +158,52 @@ def run_kline_sync():
     target_date = datetime.now().strftime('%Y-%m-%d')
     blacklist = load_blacklist()
     
-    # 这里的 tasks 已经是最终组装好的元组列表了！
     tasks = get_todo_list(target_date, blacklist)
     
     if not tasks:
-        print("✅ 所有 K 线数据均已是最新，无需同步。")
+        print("✅ 所有 K 线数据均已是最新，当前无需同步。")
         conn.close()
         return
 
-    print(f"🚀 开始同步 {len(tasks)} 只标的 K 线数据...")
+    print(f"🚀 开始日常增量同步 {len(tasks)} 只标的 K 线数据...")
         
     insert_sql = "INSERT OR REPLACE INTO daily_k_data VALUES (?,?,?,?,?,?,?,?,?,?)"
     process_count = min(8, cpu_count() * 2)
     start_time = time.time()
     
+    # ==========================================
+    # 💥 高频写库优化：内存缓冲池 (Buffer Batching)
+    # ==========================================
+    data_buffer = []
+    BUFFER_SIZE = 5000  # 满 5000 条记录才执行一次磁盘 commit
+    
     with Pool(processes=process_count, initializer=worker_init) as pool:
         for idx, result in enumerate(pool.imap_unordered(sync_single_stock, tasks), 1):
             if result['status'] == 'success' and result['data']:
-                cursor.executemany(insert_sql, result['data'])
-                conn.commit()
-                res_msg = f"✅ 更新了 {len(result['data'])} 条"
+                data_buffer.extend(result['data'])
+                res_msg = f"✅ 缓存了 {len(result['data'])} 条"
             elif result['status'] == 'success':
                 res_msg = "⚠️ 无新数据"
             else:
                 res_msg = f"❌ 失败: {result['msg'][:20]}"
             
+            # 缓冲池满了，执行一次批量落库，保护硬盘
+            if len(data_buffer) >= BUFFER_SIZE:
+                cursor.executemany(insert_sql, data_buffer)
+                conn.commit()
+                data_buffer = [] # 清空缓冲池
+            
             elapsed = time.time() - start_time
             eta = str(timedelta(seconds=int((elapsed/idx)*(len(tasks)-idx))))
             print(f"[{idx}/{len(tasks)}] {result['code']} {res_msg} | ETA: {eta}")
             
+    # 💥 循环结束后，把缓冲池里剩下的尾巴数据全部落库
+    if data_buffer:
+        cursor.executemany(insert_sql, data_buffer)
+        conn.commit()
+            
     conn.close()
-    bs.logout()
-    print("🎉 K线数据同步完成！")
+    print("🎉 K线日常增量同步完美收官！")
 
 if __name__ == "__main__":
     run_kline_sync()
