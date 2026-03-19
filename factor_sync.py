@@ -1,7 +1,7 @@
 import baostock as bs
 import sqlite3
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
 import time
 import re
@@ -62,7 +62,13 @@ def init_db():
 
 def sync_stock_basic():
     print("📡 正在同步全市场股票基础信息(行业分类)...")
-    bs.login()
+          
+    lg = bs.login()
+    print('login respond error_code:'+lg.error_code)
+    print('login respond  error_msg:'+lg.error_msg)
+    if(lg.error_code == "10001011"):
+        print("IP已经加入黑名单, 需要去QQ群里求助")
+
     rs = bs.query_stock_industry()
     if rs.error_code != '0':
         print(f"⚠️ 行业信息获取失败: {rs.error_msg}")
