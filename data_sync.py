@@ -153,6 +153,13 @@ def run_kline_sync():
             PRIMARY KEY (code, date)
         )
     """)
+
+    # 自动建立时间轴加速索引！
+    # 使用 IF NOT EXISTS，保证哪怕后续重复执行这个脚本，也不会报错
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_kdata_date ON daily_k_data(date DESC);
+    ''')
+
     conn.commit()
     
     target_date = datetime.now().strftime('%Y-%m-%d')
