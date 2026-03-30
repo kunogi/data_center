@@ -182,27 +182,42 @@ def run_kline_sync():
     # 💥 高频写库优化：内存缓冲池 (Buffer Batching)
     # ==========================================
     data_buffer = []
-    BUFFER_SIZE = 5000  # 满 5000 条记录才执行一次磁盘 commit
+    BUFFER_SIZE = 1000  # 满 5000 条记录才执行一次磁盘 commit
     
-    with Pool(processes=process_count, initializer=worker_init) as pool:
-        for idx, result in enumerate(pool.imap_unordered(sync_single_stock, tasks), 1):
-            if result['status'] == 'success' and result['data']:
-                data_buffer.extend(result['data'])
-                res_msg = f"✅ 缓存了 {len(result['data'])} 条"
-            elif result['status'] == 'success':
-                res_msg = "⚠️ 无新数据"
-            else:
-                res_msg = f"❌ 失败: {result['msg'][:20]}"
+    try:
+        with Pool(processes=process_count, initializer=worker_init) as pool:
+            for idx, result in enumerate(pool.imap_unordered(sync_single_stock, tasks), 1):
+                if result['status'] == 'success' and result['data']:
+                    data_buffer.extend(result['data'])
+                    res_msg = f"✅ 缓存了 {len(result['data'])} 条"
+                elif result['status'] == 'success':
+                    res_msg = "⚠️ 无新数据"
+                else:
+                    res_msg = f"❌ 失败: {result['msg'][:20]}"
+                
+                # 缓冲池满了，执行一次批量落库，保护硬盘
+                if len(data_buffer) >= BUFFER_SIZE:
+                    cursor.executemany(insert_sql, data_buffer)
+                    conn.commit()
+                    data_buffer = [] # 清空缓冲池
+                
+                elapsed = time.time() - start_time
+                eta = str(timedelta(seconds=int((elapsed/idx)*(len(tasks)-idx))))
+                print(f"[{idx}/{len(tasks)}] {result['code']} {res_msg} | ETA: {eta}")
+                
+    except KeyboardInterrupt:
+        # 💥 紧急抢救气囊：当按 Ctrl+C 强杀时触发
+        print("\n🚨🚨🚨 收到人工中止信号 (Ctrl+C)！正在执行内存紧急抢救...")
+        
+    finally:
+        # 💥 无论正常跑完还是被强杀，都会执行这里把剩下的尾巴落库
+        if data_buffer:
+            cursor.executemany(insert_sql, data_buffer)
+            conn.commit()
+            print(f"💾 紧急抢救成功！已将内存中最后的 {len(data_buffer)} 条数据安全落库。")
             
-            # 缓冲池满了，执行一次批量落库，保护硬盘
-            if len(data_buffer) >= BUFFER_SIZE:
-                cursor.executemany(insert_sql, data_buffer)
-                conn.commit()
-                data_buffer = [] # 清空缓冲池
-            
-            elapsed = time.time() - start_time
-            eta = str(timedelta(seconds=int((elapsed/idx)*(len(tasks)-idx))))
-            print(f"[{idx}/{len(tasks)}] {result['code']} {res_msg} | ETA: {eta}")
+    conn.close()
+    print("🏁 K线数据同步进程已安全终止。")
             
     # 💥 循环结束后，把缓冲池里剩下的尾巴数据全部落库
     if data_buffer:
