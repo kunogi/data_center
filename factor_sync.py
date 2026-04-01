@@ -61,7 +61,8 @@ def init_db():
     conn.close()
 
 def sync_stock_basic():
-    print("📡 正在同步全市场股票基础信息(行业分类)...")
+    # 删除了冗余的 log 缓存锁，每次运行都踏踏实实同步一次最新画像
+    print("📡 正在同步全市场股票基础信息(行业分类) [耗时约1分钟，请耐心等待]...")
           
     lg = bs.login()
     print('login respond error_code:'+lg.error_code)
@@ -99,6 +100,7 @@ def sync_stock_basic():
         ''', basic_data)
         conn.commit()
         conn.close()
+            
         print(f"✅ 成功更新 {len(basic_data)} 只股票的基础行业画像！")
 
 def load_progress():
@@ -122,11 +124,9 @@ def save_progress(progress_dict):
 # 🚀 多进程工作器配置
 # ==========================================
 def worker_init():
-    """每个进程单独登录，打碎长连接，防止被 T"""
     bs.login()
 
 def fetch_worker(args):
-    """单独一个进程负责拉取一只股票的数据"""
     code, quarters_set = args
     now = datetime.now()
     results = []
@@ -180,21 +180,18 @@ def run_factor_sync(auto_confirm=False):
     init_db()
     sync_stock_basic()
 
-    print("📡 正在获取 A股 股票列表...")
-    bs.login()
-    rs = bs.query_stock_basic()
-    stock_list = []
-    while (rs.error_code == '0') and rs.next():
-        row = rs.get_row_data()
-        code = row[0]
-        if code.startswith(('sh.6', 'sz.0', 'sz.30')):
-            stock_list.append(code)
-    bs.logout()
+    # 💥【提速优化】：直接废弃 1 分钟的 Baostock 网络请求，从刚刚更新的本地库极速秒提花名册！
+    print("⚡ 正在从本地画像库极速提取 A股 股票列表...")
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df_basic = pd.read_sql_query("SELECT code FROM stock_basic", conn)
+        stock_list = df_basic['code'].tolist()
+    except Exception:
+        stock_list = []
 
     print("📡 正在全盘扫描本地数据库，执行时空集合比对与空洞探测...")
     target_set = get_target_quarters(FINANCIAL_QUARTERS)
     
-    conn = sqlite3.connect(DB_PATH)
     try:
         df_existing = pd.read_sql_query("SELECT code, stat_date FROM financial_factors", conn)
         db_inventory = {}
@@ -215,7 +212,7 @@ def run_factor_sync(auto_confirm=False):
         existing_set = db_inventory.get(code, set())
         missing_set = target_set - existing_set 
         
-        # 🛡️ 核心：【次新股免疫盾】(跑完历史回测后，取消注释以恢复该功能)
+        # 🛡️ 核心：【次新股免疫盾】
         if existing_set:
             min_existing = min(existing_set)
             missing_set = {mq for mq in missing_set if mq >= min_existing}
@@ -251,10 +248,7 @@ def run_factor_sync(auto_confirm=False):
     cursor = conn.cursor()
     start_time = time.time()
     
-    # 组装任务池
     tasks = list(todo_dict.items())
-    
-    # 计算安全的并发数 (最大不要超过 16，怕把 Baostock 挤爆)
     process_count = min(16, cpu_count() * 2, total)
     print(f"🚀 启动 {process_count} 个子进程开始狂奔...")
 
@@ -267,7 +261,6 @@ def run_factor_sync(auto_confirm=False):
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     '''
 
-    # 使用进程池发起猛攻
     with Pool(processes=process_count, initializer=worker_init) as pool:
         for idx, result in enumerate(pool.imap_unordered(fetch_worker, tasks), 1):
             code = result['code']
@@ -280,10 +273,8 @@ def run_factor_sync(auto_confirm=False):
             else:
                 res_msg = f"❌ 失败: {result['msg'][:20]}"
 
-            # 无论成功失败，进入冷却期
             progress[code] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
-            # 定期保存进度，防止中途崩溃
             if idx % 50 == 0 or idx == total:
                 save_progress(progress)
 

@@ -214,18 +214,10 @@ def run_kline_sync():
         if data_buffer:
             cursor.executemany(insert_sql, data_buffer)
             conn.commit()
-            print(f"💾 紧急抢救成功！已将内存中最后的 {len(data_buffer)} 条数据安全落库。")
+            print(f"💾 紧急抢救成功/尾部数据落库！已将内存中最后的 {len(data_buffer)} 条数据安全落库。")
             
-    conn.close()
-    print("🏁 K线数据同步进程已安全终止。")
-            
-    # 💥 循环结束后，把缓冲池里剩下的尾巴数据全部落库
-    if data_buffer:
-        cursor.executemany(insert_sql, data_buffer)
-        conn.commit()
-            
-    conn.close()
-    print("🎉 K线日常增量同步完美收官！")
+        conn.close()
+        print("🏁 K线数据同步进程已安全终止。")
 
 if __name__ == "__main__":
     run_kline_sync()
