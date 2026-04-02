@@ -31,7 +31,12 @@ def get_todo_list(target_date, blacklist):
 
     # 2. 尝试：向交易所请求当日最新花名册
     print(f"📡 正在向交易所请求 {target_date} 的全市场动态花名册...")
-    bs.login()
+    lg = bs.login()
+    print('login respond error_code:'+lg.error_code)
+    print('login respond  error_msg:'+lg.error_msg)
+    if(lg.error_code == "10001011"):
+        print("IP已经加入黑名单, 需要去QQ群里求助")
+        
     rs = bs.query_all_stock(day=target_date)
     stock_list = []
     while (rs.error_code == '0') and rs.next():
