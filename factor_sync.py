@@ -57,8 +57,7 @@ def init_db():
             code TEXT, stat_date TEXT, pub_date TEXT, roe_avg REAL, yoy_profit_growth REAL,
             np_margin REAL, gp_margin REAL, eps_ttm REAL, net_profit REAL, mb_revenue REAL,
             update_date TEXT, cash_flow REAL, gross_margin REAL, 
-            net_margin REAL, cfo_to_np REAL, cfo_to_gr REAL, inv_turn_days REAL, 
-            nr_turn_days REAL, yoy_pni REAL, total_share REAL,
+            net_margin REAL, cfo_to_np REAL, cfo_to_gr REAL, yoy_pni REAL, total_share REAL,
             PRIMARY KEY (code, stat_date, pub_date)
         )
     ''')
@@ -148,7 +147,7 @@ def fetch_worker(args):
             
             if profit_df is not None and not profit_df.empty:
                 growth_df = bs.query_growth_data(code=code, year=year, quarter=quarter).get_data()
-                operation_df = bs.query_operation_data(code=code, year=year, quarter=quarter).get_data()
+                # operation_df = bs.query_operation_data(code=code, year=year, quarter=quarter).get_data()
                 cash_flow_df = bs.query_cash_flow_data(code=code, year=year, quarter=quarter).get_data()
                 
                 def safe_float(df, col, default=0.0):
@@ -177,10 +176,8 @@ def fetch_worker(args):
                     now.strftime('%Y-%m-%d %H:%M:%S'), safe_float(profit_df, 'roeAvg'),
                     safe_float(growth_df, 'YOYNI'), net_profit, safe_float(profit_df, 'epsTTM'),
                     cash_flow, safe_float(profit_df, 'MBRevenue'), safe_float(profit_df, 'totalShare'),
-                    # 移除了 liability_ratio 的输出
                     safe_float(profit_df, 'gpMargin'),    
                     safe_float(profit_df, 'npMargin'), cfo_to_np, safe_float(cash_flow_df, 'CFOToGr'),       
-                    safe_float(operation_df, 'INVTurnDays'), safe_float(operation_df, 'NRTurnDays'),   
                     safe_float(growth_df, 'YOYPNI')
                 )
                 results.append(data)
@@ -276,8 +273,8 @@ def run_factor_sync(auto_confirm=False):
             code, stat_date, pub_date, update_date, roe_avg, yoy_profit_growth, net_profit, 
             eps_ttm, cash_flow, mb_revenue, total_share,
             gp_margin, np_margin, cfo_to_np, cfo_to_gr,
-            inv_turn_days, nr_turn_days, yoy_pni
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            yoy_pni
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     '''
 
     with Pool(processes=process_count, initializer=worker_init) as pool:
