@@ -10,7 +10,6 @@ ENV/
 env.bak/
 venv.bak/
 stock_data_cache/
-quant_data.db
 reports/
 logs/
 quant_data.db-shm
@@ -18,3 +17,5 @@ quant_data.db-wal
 .vscode/
 test.py
 completed_financial_codes.txt
+quant_data.db:Zone.Identifier
+*.db
