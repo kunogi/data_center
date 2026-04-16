@@ -111,7 +111,7 @@ def compare_data(sample_size=100):
         
     sample_size = min(sample_size, len(all_codes))
     sampled_codes = random.sample(all_codes, sample_size)
-    print(f"🎲 已随机抽取 {sample_size} 只股票进行对比。")
+    print(f"🎲 已抽取 {sample_size} 只股票进行对比。")
     
     local_data = fetch_latest_local_data(sampled_codes)
     
@@ -178,4 +178,4 @@ def compare_data(sample_size=100):
     print("="*50)
 
 if __name__ == "__main__":
-    compare_data(sample_size=7000)
+    compare_data(sample_size=99999)

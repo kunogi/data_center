@@ -49,28 +49,28 @@ def audit_stock(code=None):
                 return False
             code = row[0]
             
-        # 2. 获取股票基础画像 (关联我们刚刚秒速建好的 stock_basic)
+        # 2. 获取股票基础画像
         basic_df = pd.read_sql_query("SELECT name, industry FROM stock_basic WHERE code = ?", conn, params=(code,))
         name = basic_df['name'].iloc[0] if not basic_df.empty else "未知名称"
         industry = basic_df['industry'].iloc[0] if not basic_df.empty else "未知行业"
         
-        print(f"\n" + "━"*90)
-        print(f" 🎯 【财务数据交叉审计】: {name} ({code}) | 所属行业: {industry}")
-        print("━"*90)
+        print(f"\n" + "━"*100)
+        print(f" 🎯 【同花顺 F10 交叉对账】: {name} ({code}) | 所属板块: {industry}")
+        print("━"*100)
         
-        # 3. 提取它所有的历史财报切片
+        # 3. 提取最新的历史财报切片 (完美对齐同花顺 F10 命名)
         df = pd.read_sql_query('''
-            SELECT stat_date AS 财报季, pub_date AS 发布日,
-                   net_profit AS 净利润, cash_flow AS 经营现金流,
-                   yoy_pni AS 归母净利同增,  
-                   yoy_profit_growth AS 总净利同增, 
-                   gp_margin AS 毛利率, np_margin AS 净利率,
-                   cfo_to_np AS 净利现金含量, 
-                   inv_turn_days AS 存货周转天数, nr_turn_days AS 应收周转天数,
-                   roe_avg AS ROE
+            SELECT stat_date AS 财报季, pub_date AS 东财公告日,
+                   mb_revenue AS 营业总收入, net_profit AS 归母净利润,
+                   yoy_pni AS 净利润同增,
+                   eps_raw AS 每股收益, eps_ttm AS 每股收益TTM,
+                   gp_margin AS 销售毛利率, np_margin AS 销售净利率,
+                   roe_avg AS 净资产收益率, liability_ratio AS 资产负债率,
+                   cash_flow AS 经营现金流, cfo_to_np AS 净现比
             FROM financial_factors
             WHERE code = ?
             ORDER BY stat_date DESC
+            LIMIT 8
         ''', conn, params=(code,))
         
         conn.close()
@@ -80,56 +80,60 @@ def audit_stock(code=None):
             return True
             
         # 4. 施加“同花顺视觉滤镜”
-        df['净利润'] = df['净利润'].apply(format_money)
+        df['营业总收入'] = df['营业总收入'].apply(format_money)
+        df['归母净利润'] = df['归母净利润'].apply(format_money)
         df['经营现金流'] = df['经营现金流'].apply(format_money)
-        df['归母净利同增'] = df['归母净利同增'].apply(format_pct)
-        df['总净利同增'] = df['总净利同增'].apply(format_pct)
-        df['毛利率'] = df['毛利率'].apply(format_pct)
-        df['净利率'] = df['净利率'].apply(format_pct)
-        df['ROE'] = df['ROE'].apply(format_pct)
         
-        df['净利现金含量'] = df['净利现金含量'].apply(format_num)
-        df['存货周转天数'] = df['存货周转天数'].apply(format_num)
-        df['应收周转天数'] = df['应收周转天数'].apply(format_num)
+        df['净利润同增'] = df['净利润同增'].apply(format_pct)
+        df['销售毛利率'] = df['销售毛利率'].apply(format_pct)
+        df['销售净利率'] = df['销售净利率'].apply(format_pct)
+        df['净资产收益率'] = df['净资产收益率'].apply(format_pct)
+        df['资产负债率'] = df['资产负债率'].apply(format_pct)
         
-        # 让 Pandas 在控制台对齐中文字符串
+        df['每股收益'] = df['每股收益'].apply(format_num)
+        df['每股收益TTM'] = df['每股收益TTM'].apply(format_num)
+        df['净现比'] = df['净现比'].apply(format_num)
+        
         pd.set_option('display.max_columns', None)
         pd.set_option('display.width', 1000)
         pd.set_option('display.unicode.east_asian_width', True) 
         
         print(df.to_string(index=False))
-        print("━"*90)
+        print("━"*100)
         return True
         
     except Exception as e:
         print(f"❌ 查询异常: {e}")
+        import traceback
+        traceback.print_exc()
         return True
 
 def main():
     print("🕵️ 数据中台交叉审计探针已启动...")
-    print("您可以直接与手机炒股软件的【F10 -> 财务分析】页面进行对比。")
+    print("你可以直接打开同花顺的【F10 -> 财务分析】页面进行对比。")
     
-    # 启动时先随机抽查一只
     audit_stock()
     
     while True:
         print("\n💡 操作指引：")
         print(" [回车] 🎲 随机抽取下一只盲盒股票")
-        print(" [代码] 🔍 强制查询指定股票 (例如输入: sh.600519)")
+        print(" [代码] 🔍 强制查询指定股票 (例如输入: sh.600519 或 301345)")
         print(" [q]    🚪 退出审计")
         
         user_input = input("👉 请输入指令: ").strip().lower()
         
-        if user_input == 'q' or user_input == 'quit':
+        if user_input in ['q', 'quit']:
             print("👋 审计结束，再见！")
             break
         elif user_input == '':
-            audit_stock()  # 回车随机
+            audit_stock()
         else:
-            # 兼容用户不输入 sh/sz 前缀的情况
             code = user_input
             if len(code) == 6 and code.isdigit():
-                code = f"sh.{code}" if code.startswith('6') else f"sz.{code}"
+                # 自动分配前后缀，兼容各种输入习惯
+                if code.startswith('6'): code = f"sh.{code}"
+                elif code.startswith(('0', '3')): code = f"sz.{code}"
+                elif code.startswith(('4', '8', '9')): code = f"bj.{code}"
             audit_stock(code)
 
 if __name__ == "__main__":
