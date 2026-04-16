@@ -56,7 +56,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS financial_factors (
             code TEXT, stat_date TEXT, pub_date TEXT, roe_avg REAL, yoy_profit_growth REAL,
             np_margin REAL, gp_margin REAL, eps_ttm REAL, net_profit REAL, mb_revenue REAL,
-            update_date TEXT, liability_ratio REAL, cash_flow REAL, gross_margin REAL, 
+            update_date TEXT, cash_flow REAL, gross_margin REAL, 
             net_margin REAL, cfo_to_np REAL, cfo_to_gr REAL, inv_turn_days REAL, 
             nr_turn_days REAL, yoy_pni REAL, total_share REAL,
             PRIMARY KEY (code, stat_date, pub_date)
@@ -154,8 +154,12 @@ def fetch_worker(args):
                 def safe_float(df, col, default=0.0):
                     if df is not None and not df.empty and col in df.columns:
                         val = df[col].iloc[0]
-                        try: return float(val) if val else default
-                        except: return default
+                        try: 
+                            return float(val) if val else default
+                        except Exception as e: 
+                            # 坚决不静默处理，打印确切的异常值
+                            print(f"⚠️ [警告] {code} {year}Q{quarter} 字段 {col} 转换异常: '{val}'")
+                            return default
                     return default
 
                 def safe_str(df, col, default=""):
@@ -173,7 +177,8 @@ def fetch_worker(args):
                     now.strftime('%Y-%m-%d %H:%M:%S'), safe_float(profit_df, 'roeAvg'),
                     safe_float(growth_df, 'YOYNI'), net_profit, safe_float(profit_df, 'epsTTM'),
                     cash_flow, safe_float(profit_df, 'MBRevenue'), safe_float(profit_df, 'totalShare'),
-                    safe_float(profit_df, 'liabRatio'), safe_float(profit_df, 'gpMargin'),    
+                    # 移除了 liability_ratio 的输出
+                    safe_float(profit_df, 'gpMargin'),    
                     safe_float(profit_df, 'npMargin'), cfo_to_np, safe_float(cash_flow_df, 'CFOToGr'),       
                     safe_float(operation_df, 'INVTurnDays'), safe_float(operation_df, 'NRTurnDays'),   
                     safe_float(growth_df, 'YOYPNI')
@@ -182,7 +187,10 @@ def fetch_worker(args):
         
         return {'code': code, 'status': 'success', 'data': results}
     except Exception as e:
-        return {'code': code, 'status': 'error', 'msg': str(e)}
+        import traceback
+        error_msg = f"{str(e)}\n{traceback.format_exc()}"
+        print(f"❌ {code} 数据抓取发生未捕获异常:\n{error_msg}")
+        return {'code': code, 'status': 'error', 'msg': error_msg}
 
 # ==========================================
 # 🎯 主控调度中心
@@ -266,10 +274,10 @@ def run_factor_sync(auto_confirm=False):
     insert_sql = '''
         INSERT OR REPLACE INTO financial_factors (
             code, stat_date, pub_date, update_date, roe_avg, yoy_profit_growth, net_profit, 
-            eps_ttm, cash_flow, mb_revenue, total_share, liability_ratio,
+            eps_ttm, cash_flow, mb_revenue, total_share,
             gp_margin, np_margin, cfo_to_np, cfo_to_gr,
             inv_turn_days, nr_turn_days, yoy_pni
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     '''
 
     with Pool(processes=process_count, initializer=worker_init) as pool:

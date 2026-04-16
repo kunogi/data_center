@@ -58,14 +58,14 @@ def audit_stock(code=None):
         print(f" 🎯 【同花顺 F10 交叉对账】: {name} ({code}) | 所属板块: {industry}")
         print("━"*100)
         
-        # 3. 提取最新的历史财报切片 (完美对齐同花顺 F10 命名)
+        # 3. 提取最新的历史财报切片 (已剔除废弃的 liability_ratio 和不存在的 eps_raw)
         df = pd.read_sql_query('''
-            SELECT stat_date AS 财报季, pub_date AS 东财公告日,
+            SELECT stat_date AS 财报季, pub_date AS 公告日,
                    mb_revenue AS 营业总收入, net_profit AS 归母净利润,
                    yoy_pni AS 净利润同增,
-                   eps_raw AS 每股收益, eps_ttm AS 每股收益TTM,
+                   eps_ttm AS 每股收益TTM,
                    gp_margin AS 销售毛利率, np_margin AS 销售净利率,
-                   roe_avg AS 净资产收益率, liability_ratio AS 资产负债率,
+                   roe_avg AS 净资产收益率, 
                    cash_flow AS 经营现金流, cfo_to_np AS 净现比
             FROM financial_factors
             WHERE code = ?
@@ -88,9 +88,7 @@ def audit_stock(code=None):
         df['销售毛利率'] = df['销售毛利率'].apply(format_pct)
         df['销售净利率'] = df['销售净利率'].apply(format_pct)
         df['净资产收益率'] = df['净资产收益率'].apply(format_pct)
-        df['资产负债率'] = df['资产负债率'].apply(format_pct)
         
-        df['每股收益'] = df['每股收益'].apply(format_num)
         df['每股收益TTM'] = df['每股收益TTM'].apply(format_num)
         df['净现比'] = df['净现比'].apply(format_num)
         
