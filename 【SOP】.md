@@ -6,9 +6,9 @@ python sync_all.py
 
     自己手工跑也建议按照这个顺序：因为k线数据可能会回退为使用stock_basic表里的股票代码去一个个拉数据，而stock_basic是在factor_sync里维护的
 
-python ak_staging_sync.py
+python ak_sync.py
 
-    用东财更快更新的财务数据先造个临时表，用来个screener防雷（注意定期维护里面的财报抓取日期）
+    维护来自东财的财务数据
 
 python _latest_k_data_verify.py
     
