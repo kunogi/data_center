@@ -73,6 +73,13 @@ def get_todo_list(target_date, blacklist):
     for c in raw_roster:
         clean_c = str(c).strip()
         if len(clean_c) == 9 and clean_c[2] == '.':
+            # ==========================================
+            # 💥 新增物理拦截：彻底剔除场内基金 (ETF/LOF)
+            # 上海基金以 sh.5 开头，深圳基金以 sz.1 开头
+            # ==========================================
+            if clean_c.startswith('sh.5') or clean_c.startswith('sz.1'):
+                continue
+            
             full_roster.add(clean_c)
 
     todo_list = [c for c in full_roster if c not in blacklist]
