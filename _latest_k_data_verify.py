@@ -92,7 +92,7 @@ def fetch_sina_realtime_data(codes, chunk_size=80):
                         'amount': safe_float(parts[9])  
                     }
         except Exception as e:
-            print(f"⚠️ 新浪 API 第 {idx+1} 批次请求失败: {e}")
+            print(f"⚠️ 新浪 API 第 {idx+1} 批次请求失败: {e}\n{lines}")
             
     return sina_data
 

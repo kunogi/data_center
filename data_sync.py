@@ -1,10 +1,17 @@
+import os
+# 💥 物理封印底层多线程，防止与 Python 多进程发生“线程爆炸”卡死 CPU
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 import baostock as bs
 import pandas as pd
 import sqlite3
 import requests
 import time
-import os
-import sys
+import socket
 from datetime import datetime, timedelta
 from multiprocessing import Pool, cpu_count
 from config import DB_PATH, CORE_INDICES, BLACKLIST_FILE, DAILY_K_DAYS
@@ -138,6 +145,9 @@ def fetch_eastmoney_kline(code, start_date, end_date):
         return []
 
 def worker_init():
+    # 💥 给底层的所有的网络请求强加 30 秒超时物理锁！
+    # 如果 Baostock 服务器 30 秒不回话，直接抛出 timeout 异常打断假死，释放进程
+    socket.setdefaulttimeout(30.0) 
     bs.login()
 
 def sync_single_stock(task):
