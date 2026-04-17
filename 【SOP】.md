@@ -6,6 +6,10 @@ python sync_all.py
 
     自己手工跑也建议按照这个顺序：因为k线数据可能会回退为使用stock_basic表里的股票代码去一个个拉数据，而stock_basic是在factor_sync里维护的
 
+python ak_staging_sync.py
+
+    用东财更快更新的财务数据先造个临时表，用来个screener防雷（注意定期维护里面的财报抓取日期）
+
 python _latest_k_data_verify.py
     
     k线数据同步完成后，使用sina行情串匹配全部今日入库数据有无差异
