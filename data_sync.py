@@ -181,7 +181,7 @@ def sync_single_stock(task):
                 data_list.append(rs.get_row_data())
                 
         if not data_list:
-            return {'code': code, 'status': 'success', 'msg': '无新数据', 'data': []}
+            return {'code': code, 'status': 'success', 'msg': '无新数据', 'data': [], 'warnings': []}
 
         df = pd.DataFrame(data_list, columns=["date", "code", "open", "high", "low", "close", "volume", "amount", "turn", "pctChg"])
         for col in ['open', 'high', 'low', 'close', 'volume', 'amount', 'pctChg', 'turn']:
@@ -230,22 +230,31 @@ def sync_single_stock(task):
                 full_data_list = []
                 while (rs_full.error_code == '0') and rs_full.next():
                     full_data_list.append(rs_full.get_row_data())
-
+            
             if not full_data_list:
-                return {'code': code, 'status': 'success', 'msg': '无新数据(重拉后)', 'data': []}
+                return {'code': code, 'status': 'success', 'msg': '无新数据(重拉后)', 'data': [], 'warnings': []} # 👈 补全空 warnings
                 
             df = pd.DataFrame(full_data_list, columns=["date", "code", "open", "high", "low", "close", "volume", "amount", "turn", "pctChg"])
             for col in ['open', 'high', 'low', 'close', 'volume', 'amount', 'pctChg', 'turn']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
         if df.empty:
-            return {'code': code, 'status': 'success', 'msg': '无新数据', 'data': []}
-            
+            return {'code': code, 'status': 'success', 'msg': '无新数据', 'data': [], 'warnings': []} # 👈 补全空 warnings
+        
+        # ==========================================
+        # 💥 物理常识预警：扫描异常暴跌（跌幅超 31%）
+        # ==========================================
+        warnings = []
+        abnormal_drops = df[df['pctChg'] < -31.0]
+        if not abnormal_drops.empty:
+            for _, row in abnormal_drops.iterrows():
+                warnings.append(f"⚠️ {code} 在 {row['date']} 跌幅达 {row['pctChg']:.2f}% (收盘价: {row['close']})")
+
         records = df[['date', 'code', 'open', 'high', 'low', 'close', 'volume', 'amount', 'turn', 'pctChg']].values.tolist()
-        return {'code': code, 'status': 'success', 'msg': 'ok', 'data': records}
+        return {'code': code, 'status': 'success', 'msg': 'ok', 'data': records, 'warnings': warnings} # 👈 返回警告列表
         
     except Exception as e:
-        return {'code': code, 'status': 'error', 'msg': str(e)}
+        return {'code': code, 'status': 'error', 'msg': str(e), 'warnings': []} # 👈 补全空 warnings
 
 def run_kline_sync():
     conn = get_db_conn()
@@ -293,10 +302,14 @@ def run_kline_sync():
     
     data_buffer = []
     BUFFER_SIZE = 1000
+    all_warnings = [] # 💥 新增：全局警告收集器
     
     try:
         with Pool(processes=process_count, initializer=worker_init) as pool:
             for idx, result in enumerate(pool.imap_unordered(sync_single_stock, tasks), 1):
+                # 💥 收集警告信息
+                if result.get('warnings'):
+                    all_warnings.extend(result['warnings'])
                 if result['status'] == 'success' and result['data']:
                     data_buffer.extend(result['data'])
                     res_msg = f"✅ 缓存了 {len(result['data'])} 条"
@@ -324,6 +337,19 @@ def run_kline_sync():
             print(f"💾 紧急抢救成功/尾部数据落库！已将内存中最后的 {len(data_buffer)} 条数据安全落库。")
             
         conn.close()
+        # ==========================================
+        # 💥 巡检报告：集中展示异常跌幅
+        # ==========================================
+        if all_warnings:
+            print("\n" + "!" * 80)
+            print("🚨 发现以下股票存在异常暴跌（单日跌幅 > 35%），请人工核实是否为 Baostock 脏数据：")
+            for w in all_warnings:
+                print(f"   {w}")
+            print("-" * 80)
+            print("💡 提示：如果确认为 Baostock 未复权脏数据，请进入 SQLite 清理，例如：")
+            print("   DELETE FROM daily_k_data WHERE date='20xx-xx-xx' AND code='sx.xxxxxx' limit 1;")
+            print("!" * 80 + "\n")
+            
         print("🏁 K线数据同步进程已安全终止。")
 
 if __name__ == "__main__":
