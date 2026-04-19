@@ -56,8 +56,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS financial_factors (
             code TEXT, stat_date TEXT, pub_date TEXT, roe_avg REAL, yoy_profit_growth REAL,
             np_margin REAL, gp_margin REAL, eps_ttm REAL, net_profit REAL, mb_revenue REAL,
-            update_date TEXT, cash_flow REAL, gross_margin REAL, 
-            net_margin REAL, cfo_to_np REAL, cfo_to_gr REAL, yoy_pni REAL, total_share REAL,
+            update_date TEXT, cash_flow REAL, cfo_to_np REAL, cfo_to_gr REAL, yoy_pni REAL, total_share REAL,
             PRIMARY KEY (code, stat_date, pub_date)
         )
     ''')
