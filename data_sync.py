@@ -25,7 +25,7 @@ def load_blacklist():
         return set(line.strip() for line in f if line.strip())
 
 def get_todo_list(target_date, blacklist):
-    """【真·全市场动态对齐】通过花名册 Diff 机制，自动捕捉新股并彻底过滤垃圾指数"""
+    """【真·全市场动态对齐】通过花名册 Diff 机制，自动捕捉新股、过滤基金、并斩杀退市股"""
     conn = get_db_conn()
     
     # 💥 必须带上 close 字段，供后续重叠日比对复权变化
@@ -48,20 +48,38 @@ def get_todo_list(target_date, blacklist):
     lg = bs.login()
     print('login respond error_code:'+lg.error_code)
     print('login respond  error_msg:'+lg.error_msg)
-    if(lg.error_code == "10001011"):
-        print("IP已经加入黑名单, 需要去QQ群里求助")
+    if lg.error_code == "10001011":
+        print("❌ IP已经加入黑名单, 需要去QQ群里求助解封！")
         
     rs = bs.query_all_stock(day=target_date)
     stock_list = []
+    delisted_codes = set() # 💥 隔离区：专门用来关押退市股
+    
     while (rs.error_code == '0') and rs.next():
-        stock_list.append(rs.get_row_data()[0])
+        row = rs.get_row_data()
+        code = row[0]
+        code_name = row[2]
+        
+        # ==========================================
+        # 💥 斩杀退市股烦恼：只要名字带“退”，直接打入死牢
+        # ==========================================
+        if '退' in code_name:
+            delisted_codes.add(code)
+        else:
+            stock_list.append(code)
+            
     bs.logout()
 
     if not stock_list:
         print("⚠️ 花名册请求失败，智能降级为读取本地 stock_basic 画像库名单...")
         try:
-            df_basic = pd.read_sql_query("SELECT code FROM stock_basic", conn)
-            stock_list = df_basic['code'].tolist()
+            df_basic = pd.read_sql_query("SELECT code, name FROM stock_basic", conn)
+            for _, row in df_basic.iterrows():
+                name_str = str(row['name'])
+                if '退' in name_str:
+                    delisted_codes.add(row['code'])
+                else:
+                    stock_list.append(row['code'])
         except Exception:
             stock_list = list(db_progress.keys()) 
             
@@ -73,13 +91,14 @@ def get_todo_list(target_date, blacklist):
     for c in raw_roster:
         clean_c = str(c).strip()
         if len(clean_c) == 9 and clean_c[2] == '.':
-            # ==========================================
-            # 💥 新增物理拦截：彻底剔除场内基金 (ETF/LOF)
-            # 上海基金以 sh.5 开头，深圳基金以 sz.1 开头
-            # ==========================================
+            # 物理拦截场内基金
             if clean_c.startswith('sh.5') or clean_c.startswith('sz.1'):
                 continue
-            
+                
+            # 💥 物理拦截退市股，不再为它们浪费任何 API 请求
+            if clean_c in delisted_codes:
+                continue
+                
             full_roster.add(clean_c)
 
     todo_list = [c for c in full_roster if c not in blacklist]
@@ -90,7 +109,6 @@ def get_todo_list(target_date, blacklist):
         if info:
             last_date = info['max_date']
             db_close = info['close']
-            # 从 last_date 开始拉，制造重叠日
             start_date = last_date
         else:
             last_date = None
