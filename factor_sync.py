@@ -63,55 +63,73 @@ def init_db():
     ''')
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS stock_basic (
-            code TEXT PRIMARY KEY, name TEXT, industry TEXT, industry_classification TEXT
+            code TEXT PRIMARY KEY, name TEXT, industry TEXT, industry_classification TEXT,
+            list_date TEXT
         )
     ''')
     conn.commit()
     conn.close()
 
 def sync_stock_basic():
-    # 删除了冗余的 log 缓存锁，每次运行都踏踏实实同步一次最新画像
-    print("📡 正在同步全市场股票基础信息(行业分类) [耗时约1分钟，请耐心等待]...")
+    print("📡 正在同步全市场股票基础信息(行业分类与上市时间) [耗时约1分钟，请耐心等待]...")
           
     lg = bs.login()
-    print('login respond error_code:'+lg.error_code)
-    print('login respond  error_msg:'+lg.error_msg)
-    if(lg.error_code == "10001011"):
-        print("IP已经加入黑名单, 需要去QQ群里求助")
+    if lg.error_code != '0':
+        print(f"⚠️ 登录失败: error_code={lg.error_code}, error_msg={lg.error_msg}")
+        if lg.error_code == "10001011":
+            print("❌ IP已经加入黑名单, 需要去QQ群里求助解封！")
+        return
 
-    rs = bs.query_stock_industry()
-    if rs.error_code != '0':
-        print(f"⚠️ 行业信息获取失败: {rs.error_msg}")
+    # 1. 先抓取行业字典
+    rs_ind = bs.query_stock_industry()
+    if rs_ind.error_code != '0':
+        print(f"⚠️ 行业信息获取失败: {rs_ind.error_msg}")
+        bs.logout()
+        return
+
+    ind_dict = {}
+    while rs_ind.next():
+        row = rs_ind.get_row_data()
+        code = row[1]
+        raw_industry = row[3] 
+        match = re.match(r'^([A-Za-z0-9]+)(.*)$', raw_industry)
+        if match:
+            ind_code = match.group(1); ind_name = match.group(2) 
+        else:
+            ind_code = "未知"; ind_name = raw_industry if raw_industry else "未知"
+        ind_dict[code] = (ind_name, ind_code)
+
+    # 2. 再抓取上市时间，并在内存中进行完美合并 (Join)
+    rs_basic = bs.query_stock_basic(code="")
+    if rs_basic.error_code != '0':
+        print(f"⚠️ 上市时间获取失败: {rs_basic.error_msg}")
         bs.logout()
         return
 
     basic_data = []
-    while rs.next():
-        row = rs.get_row_data()
-        code = row[1]
+    while rs_basic.next():
+        row = rs_basic.get_row_data()
+        code = row[0]
         # 极简前缀匹配：兼容所有现有及未来的沪深 A 股，天然拦截北交所与B股
         if code.startswith(('sh.6', 'sz.0', 'sz.3')):
-            name = row[2]
-            raw_industry = row[3] 
-            match = re.match(r'^([A-Za-z0-9]+)(.*)$', raw_industry)
-            if match:
-                ind_code = match.group(1); ind_name = match.group(2) 
-            else:
-                ind_code = "未知"; ind_name = raw_industry if raw_industry else "未知"
-            basic_data.append((code, name, ind_name, ind_code))
+            name = row[1]
+            list_date = row[2] # ipoDate
+            ind_name, ind_code = ind_dict.get(code, ("未知", "未知"))
+            basic_data.append((code, name, ind_name, ind_code, list_date))
+            
     bs.logout()
 
     if basic_data:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.executemany('''
-            INSERT OR REPLACE INTO stock_basic (code, name, industry, industry_classification)
-            VALUES (?, ?, ?, ?)
+            INSERT OR REPLACE INTO stock_basic (code, name, industry, industry_classification, list_date)
+            VALUES (?, ?, ?, ?, ?)
         ''', basic_data)
         conn.commit()
         conn.close()
             
-        print(f"✅ 成功更新 {len(basic_data)} 只股票的基础行业画像！")
+        print(f"✅ 成功更新 {len(basic_data)} 只股票的基础画像（含双接口合并）！")
 
 def load_progress():
     progress = {}
@@ -147,7 +165,6 @@ def fetch_worker(args):
             
             if profit_df is not None and not profit_df.empty:
                 growth_df = bs.query_growth_data(code=code, year=year, quarter=quarter).get_data()
-                # operation_df = bs.query_operation_data(code=code, year=year, quarter=quarter).get_data()
                 cash_flow_df = bs.query_cash_flow_data(code=code, year=year, quarter=quarter).get_data()
                 
                 def safe_float(df, col, default=0.0):
@@ -196,14 +213,16 @@ def run_factor_sync(auto_confirm=False):
     init_db()
     sync_stock_basic()
 
-    # 💥【提速优化】：直接废弃 1 分钟的 Baostock 网络请求，从刚刚更新的本地库极速秒提花名册！
     print("⚡ 正在从本地画像库极速提取 A股 股票列表...")
     conn = sqlite3.connect(DB_PATH)
     try:
-        df_basic = pd.read_sql_query("SELECT code FROM stock_basic", conn)
+        df_basic = pd.read_sql_query("SELECT code, list_date FROM stock_basic", conn)
         stock_list = df_basic['code'].tolist()
-    except Exception:
+        list_date_dict = dict(zip(df_basic['code'], df_basic['list_date']))
+    except Exception as e:
+        print(f"⚠️ 提取股票列表异常: {e}，将临时降级为无免疫盾模式。")
         stock_list = []
+        list_date_dict = {}
 
     print("📡 正在全盘扫描本地数据库，执行时空集合比对与空洞探测...")
     target_set = get_target_quarters(FINANCIAL_QUARTERS)
@@ -228,7 +247,19 @@ def run_factor_sync(auto_confirm=False):
         existing_set = db_inventory.get(code, set())
         missing_set = target_set - existing_set 
         
-        # 🛡️ 核心：【次新股免疫盾】
+        # 🛡️ 核心：【次新股免疫盾 - 招股书三年宽限期修复版】
+        list_date = list_date_dict.get(code)
+        if list_date and str(list_date).strip():
+            try:
+                list_year = int(str(list_date).split('-')[0])
+                allowed_start_year = list_year - 3
+                # 避开日期拼接引发的 31 号超界崩溃，纯靠年份拦截
+                missing_set = {yq for yq in missing_set if yq[0] >= allowed_start_year}
+            except Exception as e:
+                print(f"⚠️ {code} 宽限期计算异常: {e}")
+                pass
+                
+        # 兜底：保留已有残缺历史修复逻辑
         if existing_set:
             min_existing = min(existing_set)
             missing_set = {mq for mq in missing_set if mq >= min_existing}
